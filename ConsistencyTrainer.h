@@ -12,19 +12,32 @@
 
 #include <string>
 #include <map>
-#include <limits> // Required for initializing min_successful_boost_used
+#include <limits>
+#include <sstream>
 
 // Struct to hold statistics for a single shot
 struct ShotStats
 {
 	int attempts = 0;
 	int successes = 0;
-	// Boost tracking variables
+	// Boost tracking variables (Current Session)
 	float total_boost_used = 0.0f;
 	float total_successful_boost_used = 0.0f;
-	// *** NEW: Tracks the least amount of boost used on a successful attempt ***
 	float min_successful_boost_used = std::numeric_limits<float>::max();
+
+	// Persistent Lifetime Bests (Metrics tracked from the best consistency run)
+	int lifetime_best_successes = 0;
+	int lifetime_attempts_at_best = 0; // Will be equal to max_attempts_per_shot_
+	float lifetime_total_boost_at_best = 0.0f;
+	float lifetime_total_successful_boost_at_best = 0.0f;
+	float lifetime_min_boost = std::numeric_limits<float>::max(); // Absolute lowest boost used on any successful shot
 };
+
+// This map holds all lifetime ShotStats, keyed by Shot Index (int).
+using ShotPackStats = std::map<int, ShotStats>;
+// This map holds all ShotPacks, keyed by the Training Pack Code (string).
+using PersistentData = std::map<std::string, ShotPackStats>;
+
 
 class ConsistencyTrainer : public BakkesMod::Plugin::BakkesModPlugin, public BakkesMod::Plugin::PluginSettingsWindow
 {
@@ -42,8 +55,14 @@ public:
 	void RenderWindow(CanvasWrapper canvas);
 
 private:
+	// Persistence methods use string serialization
+	void LoadPersistentStats();
+	void SavePersistentStats();
+	void UpdateLifetimeBest(ShotStats& current_stats);
+	std::string GetCurrentPackID();
+
 	// Game event hooks
-	void OnGoalScored(void* params); // Simplified due to HookEvent usage in CPP
+	void OnGoalScored(void* params);
 	void OnShotReset(ActorWrapper caller, void* params, std::string eventName);
 	void OnBallExploded(void* params);
 	void OnPlaylistIndexChanged(ActorWrapper caller, void* params, std::string eventName);
@@ -73,9 +92,13 @@ private:
 	// Flag to track when a new shot starts (for boost reset)
 	bool is_new_shot_loaded_ = true;
 
-	// NEW: Stat Toggle States
+	// Stat Toggle States
 	bool show_consistency_stats_ = true;
 	bool show_boost_stats_ = false;
+
+	// The container for ALL lifetime data
+	PersistentData global_pack_stats_;
+	std::string current_pack_id_ = "";
 
 	// GUI Window state
 	bool is_window_open_ = false;
@@ -83,6 +106,6 @@ private:
 	int text_pos_y_ = 200;
 	float text_scale_ = 2.0f;
 
-	// Map to store stats for each shot index
+	// Map to store stats for each shot index (Local Session)
 	std::map<int, ShotStats> training_session_stats_;
 };

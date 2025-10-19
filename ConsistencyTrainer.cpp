@@ -1,8 +1,76 @@
 #include "pch.h"
 #include "ConsistencyTrainer.h"
 #include "imgui/imgui.h"
-#include <limits> // Required for std::numeric_limits
-// This master header includes all necessary wrapper definitions, including ActorWrapper and CanvasWrapper.
+#include <limits>
+#include <sstream> 
+#include <algorithm>
+#include <iostream> 
+
+// Helper functions for basic serialization (using a simple, parsable format)
+std::string SerializeStats(const PersistentData& data) {
+    std::stringstream ss;
+    // Structure: PackID|ShotIndex|LBS|LBTB|LBTSB|LMB;PackID|ShotIndex|LBS|LBA|LMB;...
+    for (const auto& pack_pair : data) {
+        const std::string& pack_id = pack_pair.first;
+        for (const auto& shot_pair : pack_pair.second) {
+            ss << pack_id << "|"
+                << shot_pair.first << "|"
+                << shot_pair.second.lifetime_best_successes << "|"
+                << shot_pair.second.lifetime_total_boost_at_best << "|"
+                << shot_pair.second.lifetime_total_successful_boost_at_best << "|"
+                << shot_pair.second.lifetime_min_boost
+                << ";";
+        }
+    }
+    std::string result = ss.str();
+    if (!result.empty()) {
+        result.pop_back(); // Remove trailing semicolon
+    }
+    return result;
+}
+
+PersistentData DeserializeStats(const std::string& str) {
+    PersistentData data;
+    if (str.empty()) return data;
+
+    std::stringstream ss(str);
+    std::string record;
+
+    // Split by semicolon (pack records)
+    while (std::getline(ss, record, ';')) {
+        std::stringstream rs(record);
+        std::string segment;
+        std::vector<std::string> segments;
+
+        // Split by pipe (individual fields)
+        while (std::getline(rs, segment, '|')) {
+            segments.push_back(segment);
+        }
+
+        // Expecting 6 segments now (PackID, ShotIndex, LBS, LBTB, LBTSB, LMB)
+        if (segments.size() == 6) {
+            std::string pack_id = segments[0];
+            int shot_index = std::stoi(segments[1]);
+            ShotStats s;
+            s.lifetime_best_successes = std::stoi(segments[2]);
+            s.lifetime_total_boost_at_best = std::stof(segments[3]);
+            s.lifetime_total_successful_boost_at_best = std::stof(segments[4]);
+            s.lifetime_min_boost = std::stof(segments[5]);
+
+            // Re-initialize session-specific parts safely
+            s.attempts = 0; s.successes = 0; s.total_boost_used = 0.0f;
+            s.total_successful_boost_used = 0.0f;
+            s.min_successful_boost_used = std::numeric_limits<float>::max();
+
+            // The lifetime attempts at best should match max_attempts_per_shot_ (10 by default)
+            s.lifetime_attempts_at_best = 10;
+
+            data[pack_id][shot_index] = s;
+        }
+    }
+    return data;
+}
+
 BAKKESMOD_PLUGIN(ConsistencyTrainer, "Consistency Trainer", "1.0.0", PLUGINTYPE_CUSTOM_TRAINING)
 
 std::shared_ptr<CVarManagerWrapper> _globalCvarManager;
@@ -36,6 +104,9 @@ void ConsistencyTrainer::onLoad()
     cvarManager->registerCvar("ct_show_boost", "0", "Show boost usage stats")
         .addOnValueChanged([this](std::string, CVarWrapper cvar) { show_boost_stats_ = cvar.getBoolValue(); });
 
+    // FIX: Hidden CVar for persistent string data
+    cvarManager->registerCvar("ct_persistent_data", "", "String storage for lifetime stats", true, true, 0.0f, true, 0.0f, true);
+
 
     is_plugin_enabled_ = cvarManager->getCvar("ct_plugin_enabled").getBoolValue();
     max_attempts_per_shot_ = cvarManager->getCvar("ct_max_attempts").getIntValue();
@@ -48,6 +119,9 @@ void ConsistencyTrainer::onLoad()
     show_consistency_stats_ = cvarManager->getCvar("ct_show_consistency").getBoolValue();
     show_boost_stats_ = cvarManager->getCvar("ct_show_boost").getBoolValue();
 
+    // FIX: Load persistent stats on plugin load
+    LoadPersistentStats();
+
 
     // Event hooks
     // Hook updated to match the simplified handler signature
@@ -57,8 +131,7 @@ void ConsistencyTrainer::onLoad()
     gameWrapper->HookEventWithCallerPost<ActorWrapper>("Function TAGame.GameEvent_TrainingEditor_TA.OnResetShot",
         std::bind(&ConsistencyTrainer::OnShotReset, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 
-    // *** FIX: Removed OnBallExploded hook to prevent failure/success race condition ***
-    // gameWrapper->HookEvent("Function TAGame.Ball_TA.EventExploded", [this](...) { OnBallExploded(nullptr); });
+    // OnBallExploded hook removed to prevent race condition
 
     gameWrapper->HookEventWithCallerPost<ActorWrapper>("Function TAGame.TrainingEditorNavigation_TA.SetCurrentActivePlaylistIndex",
         std::bind(&ConsistencyTrainer::OnPlaylistIndexChanged, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
@@ -82,18 +155,81 @@ void ConsistencyTrainer::onLoad()
 }
 
 void ConsistencyTrainer::onUnload() {
+    // FIX: Save current pack stats on unload
+    if (!training_session_stats_.empty() && !current_pack_id_.empty()) {
+        global_pack_stats_[current_pack_id_] = training_session_stats_;
+    }
+    SavePersistentStats();
+
     gameWrapper->UnregisterDrawables();
     // We should unhook the constant SetVehicleInput to free resources
     gameWrapper->UnhookEvent("Function TAGame.Car_TA.SetVehicleInput");
 }
 
+// *** FIX: Uses TrainingEditorWrapper::GetTrainingFileName() for the unique ID ***
+std::string ConsistencyTrainer::GetCurrentPackID() {
+    if (!gameWrapper->IsInCustomTraining()) return "";
+
+    ServerWrapper server = gameWrapper->GetCurrentGameState();
+    if (server.IsNull()) return "";
+
+    TrainingEditorWrapper training_editor(server.memory_address);
+    if (training_editor.IsNull()) return "";
+
+    // Use GetTrainingFileName() as it is present in the wrapper definition provided.
+    return training_editor.GetTrainingFileName().ToString();
+}
+
+// *** FIX: Logic to load persistent stats from CVar ***
+void ConsistencyTrainer::LoadPersistentStats() {
+    CVarWrapper cvar = cvarManager->getCvar("ct_persistent_data");
+    if (!cvar) return;
+
+    std::string storage_str = cvar.getStringValue();
+    if (storage_str.empty()) {
+        global_pack_stats_.clear();
+        cvarManager->log("Persistence CVar is empty.");
+        return;
+    }
+
+    try {
+        global_pack_stats_ = DeserializeStats(storage_str);
+        cvarManager->log("Loaded persistent stats for " + std::to_string(global_pack_stats_.size()) + " packs.");
+    }
+    catch (const std::exception& e) {
+        cvarManager->log("Error deserializing persistent data. Resetting stats. Error: " + std::string(e.what()));
+        global_pack_stats_.clear();
+    }
+}
+
+// *** FIX: Logic to save persistent stats to CVar ***
+void ConsistencyTrainer::SavePersistentStats() {
+    // Only save if there is an active pack's data to save
+    if (global_pack_stats_.empty()) return;
+
+    try {
+        std::string serialized_data = SerializeStats(global_pack_stats_);
+        cvarManager->getCvar("ct_persistent_data").setValue(serialized_data);
+        cvarManager->log("Saved persistent stats.");
+    }
+    catch (const std::exception& e) {
+        cvarManager->log("Error saving persistent data. Error: " + std::string(e.what()));
+    }
+}
+
 // Safely initializes the session map ONLY when training starts 
 void ConsistencyTrainer::InitializeSessionStats()
 {
+    // FIX: Save existing pack stats before initializing the new pack
+    if (!training_session_stats_.empty() && !current_pack_id_.empty()) {
+        global_pack_stats_[current_pack_id_] = training_session_stats_;
+    }
+
     training_session_stats_.clear();
     current_shot_index_ = 0;
     current_attempt_boost_used_ = 0.0f; // Reset boost tracker
     is_new_shot_loaded_ = true; // Mark as new shot
+    current_pack_id_ = GetCurrentPackID(); // Set new pack ID
 
     if (gameWrapper->IsInCustomTraining())
     {
@@ -103,33 +239,87 @@ void ConsistencyTrainer::InitializeSessionStats()
         TrainingEditorWrapper training_editor(server.memory_address);
         if (training_editor.IsNull()) return;
 
+        // FIX: Load persistent data for the new pack if it exists
+        if (global_pack_stats_.count(current_pack_id_)) {
+            // Load lifetime stats into the session map
+            training_session_stats_ = global_pack_stats_.at(current_pack_id_);
+        }
+
+        // Ensure all rounds exist and initialize any missing or session-specific parts
         int total_shots = training_editor.GetTotalRounds();
         for (int i = 0; i < total_shots; ++i) {
-            training_session_stats_[i] = ShotStats();
-            // Initialize min boost to max possible float value
-            training_session_stats_[i].min_successful_boost_used = std::numeric_limits<float>::max();
+            if (training_session_stats_.find(i) == training_session_stats_.end()) {
+                // If a shot is new or missing, create a fresh entry
+                training_session_stats_[i] = ShotStats();
+                // Initialize min boost to max possible float value
+                training_session_stats_[i].min_successful_boost_used = std::numeric_limits<float>::max();
+            }
+            else {
+                // For existing shots, reset session-specific stats
+                ShotStats& stats = training_session_stats_[i];
+                stats.attempts = 0;
+                stats.successes = 0;
+                stats.total_boost_used = 0.0f;
+                stats.total_successful_boost_used = 0.0f;
+                stats.min_successful_boost_used = std::numeric_limits<float>::max();
+                // FIX: Re-initialize the lifetime-dependent variable if missing
+                if (stats.lifetime_min_boost == 0.0f) {
+                    stats.lifetime_min_boost = std::numeric_limits<float>::max();
+                }
+            }
         }
         current_shot_index_ = training_editor.GetRoundNum();
     }
-    cvarManager->log("Session stats initialized.");
+    cvarManager->log("Session stats initialized for pack: " + current_pack_id_);
 }
 
 // FIX: Iterate and zero out values instead of clearing the map
 void ConsistencyTrainer::ResetSessionStats()
 {
-    // Iterate over the existing map and zero out the counts. Safe and fast.
+    // Iterate over the existing map and zero out the current session counts. 
     for (auto& pair : training_session_stats_) {
+        // Only reset session-specific values, preserve lifetime data
         pair.second.attempts = 0;
         pair.second.successes = 0;
-        pair.second.total_boost_used = 0.0f; // Reset boost totals
-        pair.second.total_successful_boost_used = 0.0f; // Reset successful boost totals
-        // Reset min boost to max possible float value
+        pair.second.total_boost_used = 0.0f;
+        pair.second.total_successful_boost_used = 0.0f;
+        // Reset current session min boost to max possible float value
         pair.second.min_successful_boost_used = std::numeric_limits<float>::max();
     }
-    current_attempt_boost_used_ = 0.0f; // Reset boost tracker
-    is_new_shot_loaded_ = true; // Mark as new shot
+    current_attempt_boost_used_ = 0.0f;
+    is_new_shot_loaded_ = true;
     cvarManager->log("Session stats reset by user action (values zeroed).");
 }
+
+// Logic to check and update lifetime bests
+void ConsistencyTrainer::UpdateLifetimeBest(ShotStats& stats) {
+    // We only update lifetime bests when the current session's attempts equal the max.
+    if (stats.attempts == max_attempts_per_shot_) {
+
+        // 1. Update Consistency & Associated Boost Metrics
+        // Check if current success count is better than the lifetime best
+        if (stats.successes > stats.lifetime_best_successes) {
+            stats.lifetime_best_successes = stats.successes;
+            // Record the metrics associated with this new best consistency run
+            stats.lifetime_total_boost_at_best = stats.total_boost_used;
+            stats.lifetime_total_successful_boost_at_best = stats.total_successful_boost_used;
+            // The attempts are always max_attempts_per_shot_
+            stats.lifetime_attempts_at_best = max_attempts_per_shot_;
+
+            cvarManager->log("New Lifetime Best Consistency for Shot " + std::to_string(current_shot_index_ + 1) + ": " + std::to_string(stats.successes) + "/" + std::to_string(stats.lifetime_attempts_at_best));
+        }
+    }
+
+    // 2. Update Absolute Minimum Successful Boost (This is tracked independently)
+    // Check if the best min_successful_boost_used recorded in the current session (for THIS specific shot) is better than the lifetime best.
+    if (stats.min_successful_boost_used != std::numeric_limits<float>::max() &&
+        stats.min_successful_boost_used < stats.lifetime_min_boost)
+    {
+        stats.lifetime_min_boost = stats.min_successful_boost_used;
+        cvarManager->log("New Lifetime Best Min Boost (Individual) for Shot " + std::to_string(current_shot_index_ + 1) + ": " + std::to_string(stats.lifetime_min_boost));
+    }
+}
+
 
 // NEW: Gatekeeper check for when max attempts are reached
 bool ConsistencyTrainer::IsShotFrozen()
@@ -204,8 +394,6 @@ void ConsistencyTrainer::OnShotReset(ActorWrapper caller, void* params, std::str
         return;
     }
 
-    // The OnShotReset event is reliable for logging a fail/user reset in custom training.
-    // We now rely on the 0.01s delay in OnGoalScored to prevent double-logging.
     if (IsShotFrozen()) return;
 
     // Use a small timeout for failure too, to ensure we don't interfere with the delayed success logic.
@@ -214,17 +402,24 @@ void ConsistencyTrainer::OnShotReset(ActorWrapper caller, void* params, std::str
     }, 0.01f);
 }
 
-// *** FIX: OnBallExploded handler removed from logic to prevent race condition ***
 void ConsistencyTrainer::OnBallExploded(void* params)
 {
     // Do nothing. Reliance is now on OnGoalScored and OnShotReset.
 }
 
+// *** MODIFIED: OnPlaylistIndexChanged now handles saving/updating lifetime bests on shot change ***
 void ConsistencyTrainer::OnPlaylistIndexChanged(ActorWrapper caller, void* params, std::string eventName)
 {
     if (!is_plugin_enabled_ || params == nullptr) return;
 
     PlaylistIndexParams* p = static_cast<PlaylistIndexParams*>(params);
+
+    // If the index changed AND we were in a valid session, update the lifetime bests for the old shot.
+    if (current_shot_index_ != p->Index && !training_session_stats_.empty()) {
+        UpdateLifetimeBest(training_session_stats_[current_shot_index_]);
+        // Also save the current session data immediately when the player moves to a different shot
+        SavePersistentStats();
+    }
 
     if (current_shot_index_ != p->Index) {
         current_shot_index_ = p->Index;
@@ -277,6 +472,11 @@ void ConsistencyTrainer::HandleAttempt(bool isSuccess)
             gameWrapper->SetTimeout([this](...) { RepeatCurrentShot(); }, 0.05f);
         }
         else {
+            // *** FIX: Update lifetime best on final attempt BEFORE ADVANCING ***
+            UpdateLifetimeBest(stats);
+            // *** FIX: AUTOMATICALLY SAVE STATS ON SHOT COMPLETION ***
+            SavePersistentStats();
+
             // Max attempts reached, advance to the next shot
             gameWrapper->SetTimeout([this](...) { AdvanceToNextShot(); }, 0.05f);
         }
@@ -327,35 +527,43 @@ void ConsistencyTrainer::RenderSettings()
     ImGui::SameLine();
     if (ImGui::Button("Reset Current Session Stats")) { ResetSessionStats(); }
     ImGui::Spacing();
+    // NEW: Manual Save button remains for user convenience/debug
+    if (ImGui::Button("Manually Save Lifetime Stats")) { SavePersistentStats(); }
+    ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
     ImGui::Text("Overall Session Stats:");
+    ImGui::Text("Active Pack: %s", current_pack_id_.empty() ? "None" : current_pack_id_.c_str());
     if (training_session_stats_.empty()) { ImGui::Text("Load a training pack to see shot list."); }
     else
     {
         ImGui::Columns(7, "session_stats_table", true); // EXPANDED COLUMNS
         ImGui::Text("Shot #"); ImGui::NextColumn();
-        ImGui::Text("Successes"); ImGui::NextColumn();
+        ImGui::Text("Success/Best"); ImGui::NextColumn();
         ImGui::Text("Attempts"); ImGui::NextColumn();
         ImGui::Text("Consistency"); ImGui::NextColumn();
         ImGui::Text("Avg Boost (All)"); ImGui::NextColumn();
-        ImGui::Text("Avg Boost (Success)"); ImGui::NextColumn();
-        ImGui::Text("Min Boost (Success)"); ImGui::NextColumn(); // NEW COLUMN
+        ImGui::Text("Avg Boost (Success/Best)"); ImGui::NextColumn(); // Combined display
+        ImGui::Text("Min Boost (Curr/Best)"); ImGui::NextColumn(); // NEW COLUMN
         ImGui::Separator();
         for (const auto& pair : training_session_stats_)
         {
             float consistency = (pair.second.attempts > 0) ? (static_cast<float>(pair.second.successes) / pair.second.attempts * 100.0f) : 0.0f;
             float avg_boost = (pair.second.attempts > 0) ? (pair.second.total_boost_used / pair.second.attempts) : 0.0f;
             float avg_success_boost = (pair.second.successes > 0) ? (pair.second.total_successful_boost_used / pair.second.successes) : 0.0f;
-            float min_success_boost = (pair.second.min_successful_boost_used != std::numeric_limits<float>::max()) ? pair.second.min_successful_boost_used : 0.0f; // Display 0 if not set
+            float avg_success_boost_best_consist = (pair.second.lifetime_attempts_at_best > 0 && pair.second.lifetime_best_successes > 0) ? (pair.second.lifetime_total_successful_boost_at_best / pair.second.lifetime_best_successes) : 0.0f;
+
+            float min_success_boost_curr = (pair.second.min_successful_boost_used != std::numeric_limits<float>::max()) ? pair.second.min_successful_boost_used : 0.0f;
+            float min_success_boost_life = (pair.second.lifetime_min_boost != std::numeric_limits<float>::max()) ? pair.second.lifetime_min_boost : 0.0f;
 
             ImGui::Text("%d", pair.first + 1); ImGui::NextColumn();
-            ImGui::Text("%d", pair.second.successes); ImGui::NextColumn();
+            // Display Current/Lifetime Best Consistency
+            ImGui::Text("%d/%d", pair.second.successes, pair.second.lifetime_best_successes); ImGui::NextColumn();
             ImGui::Text("%d", pair.second.attempts); ImGui::NextColumn();
             ImGui::Text("%.1f%%", consistency); ImGui::NextColumn();
             ImGui::Text("%.1f", avg_boost); ImGui::NextColumn();
-            ImGui::Text("%.1f", avg_success_boost); ImGui::NextColumn();
-            ImGui::Text("%.1f", min_success_boost); ImGui::NextColumn(); // NEW VALUE
+            ImGui::Text("%.1f/%.1f", avg_success_boost, avg_success_boost_best_consist); ImGui::NextColumn();
+            ImGui::Text("%.1f/%.1f", min_success_boost_curr, min_success_boost_life); ImGui::NextColumn();
         }
         ImGui::Columns(1);
     }
@@ -382,7 +590,10 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
     float consistency = (current_stats.attempts > 0) ? (static_cast<float>(current_stats.successes) / current_stats.attempts * 100.0f) : 0.0f;
     float avg_boost = (current_stats.attempts > 0) ? (current_stats.total_boost_used / current_stats.attempts) : 0.0f;
     float avg_success_boost = (current_stats.successes > 0) ? (current_stats.total_successful_boost_used / current_stats.successes) : 0.0f;
-    float min_success_boost = (current_stats.min_successful_boost_used != std::numeric_limits<float>::max()) ? current_stats.min_successful_boost_used : 0.0f;
+    float avg_success_boost_best_consist = (current_stats.lifetime_attempts_at_best > 0 && current_stats.lifetime_best_successes > 0) ? (current_stats.lifetime_total_successful_boost_at_best / current_stats.lifetime_best_successes) : 0.0f;
+    float min_success_boost_curr = (current_stats.min_successful_boost_used != std::numeric_limits<float>::max()) ? current_stats.min_successful_boost_used : 0.0f;
+    float min_success_boost_life = (current_stats.lifetime_min_boost != std::numeric_limits<float>::max()) ? current_stats.lifetime_min_boost : 0.0f;
+
 
     // Line drawing variables
     float line_height = 20.0f * text_scale_; // Rough estimate of line height based on scale
@@ -393,7 +604,7 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
 
     // --- 1. Consistency Stats ---
     if (show_consistency_stats_) {
-        // Line 1: Current Shot
+        // *** FIX: Removed Pack ID from canvas display ***
         snprintf(buffer, sizeof(buffer), "Current Shot: %d", current_shot_index_ + 1);
         canvas.SetPosition(Vector2{ text_pos_x_, current_y });
         canvas.DrawString(buffer, text_scale_, text_scale_);
@@ -405,8 +616,8 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
         canvas.DrawString(buffer, text_scale_, text_scale_);
         current_y += line_height;
 
-        // Line 3: Successes
-        snprintf(buffer, sizeof(buffer), "Successes: %d", current_stats.successes);
+        // Line 3: Successes (Current vs. Lifetime Best)
+        snprintf(buffer, sizeof(buffer), "Successes: %d / Best: %d", current_stats.successes, current_stats.lifetime_best_successes);
         canvas.SetPosition(Vector2{ text_pos_x_, current_y });
         canvas.DrawString(buffer, text_scale_, text_scale_);
         current_y += line_height;
@@ -435,14 +646,14 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
         canvas.DrawString(buffer, text_scale_, text_scale_);
         current_y += line_height;
 
-        // Line 7: Avg Success
-        snprintf(buffer, sizeof(buffer), "Avg (Success): %.1f", avg_success_boost);
+        // Line 7: Avg Success / Avg Best Consistency
+        snprintf(buffer, sizeof(buffer), "Avg (S) / Best (C) Avg: %.1f / %.1f", avg_success_boost, avg_success_boost_best_consist);
         canvas.SetPosition(Vector2{ text_pos_x_, current_y });
         canvas.DrawString(buffer, text_scale_, text_scale_);
         current_y += line_height;
 
-        // Line 8: Min Success *** NEW VALUE ***
-        snprintf(buffer, sizeof(buffer), "Min (Success): %.1f", min_success_boost);
+        // Line 8: Min Success (Current vs. Lifetime Best)
+        snprintf(buffer, sizeof(buffer), "Min (S): %.1f / Best: %.1f", min_success_boost_curr, min_success_boost_life);
         canvas.SetPosition(Vector2{ text_pos_x_, current_y });
         canvas.DrawString(buffer, text_scale_, text_scale_);
         current_y += line_height;
