@@ -29,6 +29,13 @@ void ConsistencyTrainer::onLoad()
     cvarManager->registerCvar("ct_window_open", "0", "Show/Hide the in-game stats window")
         .addOnValueChanged([this](std::string, CVarWrapper cvar) { is_window_open_ = cvar.getBoolValue(); });
 
+    // NEW: CVars for toggling stat groups
+    cvarManager->registerCvar("ct_show_consistency", "1", "Show core consistency stats (attempts/successes)")
+        .addOnValueChanged([this](std::string, CVarWrapper cvar) { show_consistency_stats_ = cvar.getBoolValue(); });
+    cvarManager->registerCvar("ct_show_boost", "0", "Show boost usage stats")
+        .addOnValueChanged([this](std::string, CVarWrapper cvar) { show_boost_stats_ = cvar.getBoolValue(); });
+
+
     is_plugin_enabled_ = cvarManager->getCvar("ct_plugin_enabled").getBoolValue();
     max_attempts_per_shot_ = cvarManager->getCvar("ct_max_attempts").getIntValue();
     text_pos_x_ = cvarManager->getCvar("ct_text_x").getIntValue();
@@ -36,11 +43,15 @@ void ConsistencyTrainer::onLoad()
     text_scale_ = cvarManager->getCvar("ct_text_scale").getFloatValue();
     // Load state for Stats Window
     is_window_open_ = cvarManager->getCvar("ct_window_open").getBoolValue();
+    // Load state for stat toggles
+    show_consistency_stats_ = cvarManager->getCvar("ct_show_consistency").getBoolValue();
+    show_boost_stats_ = cvarManager->getCvar("ct_show_boost").getBoolValue();
 
 
     // Event hooks
-    gameWrapper->HookEventWithCaller<ActorWrapper>("Function TAGame.GameMetrics_TA.GoalScored",
-        std::bind(&ConsistencyTrainer::OnGoalScored, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+    // *** FIX: Hook updated to match the simplified handler signature ***
+    gameWrapper->HookEvent("Function TAGame.GameMetrics_TA.GoalScored",
+        [this](...) { OnGoalScored(nullptr); }); // Only passing params
 
     gameWrapper->HookEventWithCallerPost<ActorWrapper>("Function TAGame.GameEvent_TrainingEditor_TA.OnResetShot",
         std::bind(&ConsistencyTrainer::OnShotReset, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
@@ -57,6 +68,9 @@ void ConsistencyTrainer::onLoad()
     gameWrapper->HookEvent("Function TAGame.TrainingEditorMetrics_TA.TrainingShotAttempt",
         [this](...) { OnShotAttempt(nullptr); });
 
+    // Hook: Track boost usage every tick
+    gameWrapper->HookEvent("Function TAGame.Car_TA.SetVehicleInput", [this](std::string eventName) { OnSetVehicleInput(eventName); });
+
 
     gameWrapper->RegisterDrawable(std::bind(&ConsistencyTrainer::RenderWindow, this, std::placeholders::_1));
     // Notifier now toggles the CVar for the settings window
@@ -65,13 +79,19 @@ void ConsistencyTrainer::onLoad()
     }, "Toggle the Consistency Trainer window", PERMISSION_ALL);
 }
 
-void ConsistencyTrainer::onUnload() { gameWrapper->UnregisterDrawables(); }
+void ConsistencyTrainer::onUnload() {
+    gameWrapper->UnregisterDrawables();
+    // We should unhook the constant SetVehicleInput to free resources
+    gameWrapper->UnhookEvent("Function TAGame.Car_TA.SetVehicleInput");
+}
 
 // Safely initializes the session map ONLY when training starts 
 void ConsistencyTrainer::InitializeSessionStats()
 {
     training_session_stats_.clear();
     current_shot_index_ = 0;
+    current_attempt_boost_used_ = 0.0f; // Reset boost tracker
+    is_new_shot_loaded_ = true; // Mark as new shot
 
     if (gameWrapper->IsInCustomTraining())
     {
@@ -97,11 +117,15 @@ void ConsistencyTrainer::ResetSessionStats()
     for (auto& pair : training_session_stats_) {
         pair.second.attempts = 0;
         pair.second.successes = 0;
+        pair.second.total_boost_used = 0.0f; // Reset boost totals
+        pair.second.total_successful_boost_used = 0.0f; // Reset successful boost totals
     }
+    current_attempt_boost_used_ = 0.0f; // Reset boost tracker
+    is_new_shot_loaded_ = true; // Mark as new shot
     cvarManager->log("Session stats reset by user action (values zeroed).");
 }
 
-// *** NEW: Gatekeeper check for when max attempts are reached ***
+// NEW: Gatekeeper check for when max attempts are reached
 bool ConsistencyTrainer::IsShotFrozen()
 {
     if (training_session_stats_.find(current_shot_index_) == training_session_stats_.end()) return true;
@@ -110,25 +134,54 @@ bool ConsistencyTrainer::IsShotFrozen()
     return stats.attempts >= max_attempts_per_shot_;
 }
 
+// FIXED: Per-tick boost tracking function using CarWrapper::GetInput()
+void ConsistencyTrainer::OnSetVehicleInput(std::string eventName)
+{
+    if (!is_plugin_enabled_ || !gameWrapper->IsInCustomTraining() || IsShotFrozen()) return;
+
+    // Check if the current shot has started (to accumulate boost)
+    if (is_new_shot_loaded_ || training_session_stats_.empty()) return;
+
+    CarWrapper car = gameWrapper->GetLocalCar();
+    if (car.IsNull()) return;
+
+    // Get input directly from the local car wrapper
+    ControllerInput input = car.GetInput();
+
+    // Standard boost usage rate is 33.33 units per second. Physics tick is 120Hz.
+    const float BOOST_PER_TICK = (33.333333f / 120.0f);
+
+    // Check if the player is holding the boost button
+    if (input.HoldingBoost) {
+        current_attempt_boost_used_ += BOOST_PER_TICK;
+    }
+}
+
 
 // --- Event Handlers ---
 void ConsistencyTrainer::OnShotAttempt(void* params)
 {
-    if (!is_plugin_enabled_ || !IsInValidTraining() || IsShotFrozen()) return; // *** FREEZE CHECK ***
+    if (!is_plugin_enabled_ || !IsInValidTraining() || IsShotFrozen()) return;
 
-    if (training_session_stats_.find(current_shot_index_) != training_session_stats_.end())
+    // The is_new_shot_loaded_ flag ensures we only do this once after the shot starts.
+    if (is_new_shot_loaded_)
     {
-        ShotStats& stats = training_session_stats_[current_shot_index_];
-        if (stats.attempts < max_attempts_per_shot_) {
-            stats.attempts++;
-            cvarManager->log("Attempt " + std::to_string(stats.attempts) + " started for shot " + std::to_string(current_shot_index_ + 1));
+        if (training_session_stats_.find(current_shot_index_) != training_session_stats_.end())
+        {
+            ShotStats& stats = training_session_stats_[current_shot_index_];
+            if (stats.attempts < max_attempts_per_shot_) {
+                stats.attempts++;
+                cvarManager->log("Attempt " + std::to_string(stats.attempts) + " started for shot " + std::to_string(current_shot_index_ + 1));
+            }
         }
+        is_new_shot_loaded_ = false;
     }
 }
 
-void ConsistencyTrainer::OnGoalScored(ActorWrapper caller, void* params, std::string eventName)
+// *** FIX: Changed function definition to match simplified header declaration ***
+void ConsistencyTrainer::OnGoalScored(void* params)
 {
-    if (!is_plugin_enabled_ || !IsInValidTraining() || IsShotFrozen()) return; // *** FREEZE CHECK ***
+    if (!is_plugin_enabled_ || !IsInValidTraining() || IsShotFrozen()) return;
     HandleAttempt(true);
 }
 
@@ -141,14 +194,14 @@ void ConsistencyTrainer::OnShotReset(ActorWrapper caller, void* params, std::str
         return;
     }
 
-    if (IsShotFrozen()) return; // *** FREEZE CHECK ***
+    if (IsShotFrozen()) return;
 
     HandleAttempt(false);
 }
 
 void ConsistencyTrainer::OnBallExploded(void* params)
 {
-    if (!is_plugin_enabled_ || !IsInValidTraining() || IsShotFrozen()) return; // *** FREEZE CHECK ***
+    if (!is_plugin_enabled_ || !IsInValidTraining() || IsShotFrozen()) return;
     HandleAttempt(false);
 }
 
@@ -162,12 +215,16 @@ void ConsistencyTrainer::OnPlaylistIndexChanged(ActorWrapper caller, void* param
         current_shot_index_ = p->Index;
         cvarManager->log("Playlist index changed to: " + std::to_string(current_shot_index_));
     }
+    // Reset boost tracker for the new shot
+    current_attempt_boost_used_ = 0.0f;
+    is_new_shot_loaded_ = true;
 }
 
 
 // --- Core Logic ---
 bool ConsistencyTrainer::IsInValidTraining() { return gameWrapper->IsInCustomTraining(); }
 
+// MODIFIED: HandleAttempt now saves boost data
 void ConsistencyTrainer::HandleAttempt(bool isSuccess)
 {
     // Ensure we have stats for the current shot
@@ -180,14 +237,21 @@ void ConsistencyTrainer::HandleAttempt(bool isSuccess)
     // We only proceed if an attempt was recorded (stats.attempts > 0)
     if (stats.attempts > 0 && stats.attempts <= max_attempts_per_shot_) {
 
-        // 1. RECORD SUCCESS/FAILURE STATUS FIRST
+        // 1. RECORD SUCCESS/FAILURE STATUS & BOOST USAGE FIRST
+        stats.total_boost_used += current_attempt_boost_used_;
+
         if (isSuccess) {
             stats.successes++;
-            cvarManager->log("SUCCESS recorded. Successes is now: " + std::to_string(stats.successes));
+            stats.total_successful_boost_used += current_attempt_boost_used_;
+            cvarManager->log("SUCCESS recorded. Boost Used: " + std::to_string(current_attempt_boost_used_));
         }
         else {
-            cvarManager->log("FAILURE recorded for attempt " + std::to_string(stats.attempts));
+            cvarManager->log("FAILURE recorded for attempt " + std::to_string(stats.attempts) + ". Boost Used: " + std::to_string(current_attempt_boost_used_));
         }
+
+        // Reset boost tracker for the next attempt (even if it's a repeat of the same shot)
+        current_attempt_boost_used_ = 0.0f;
+        is_new_shot_loaded_ = true; // Set to true so OnShotAttempt can fire again
 
         // 2. CHECK ATTEMPT COUNT AND DECIDE NEXT ACTION
         if (stats.attempts < max_attempts_per_shot_) {
@@ -235,6 +299,11 @@ void ConsistencyTrainer::RenderSettings()
     ImGui::Spacing();
     // Checkbox for permanent setting
     if (ImGui::Checkbox("Show In-Game Stats", &is_window_open_)) { cvarManager->getCvar("ct_window_open").setValue(is_window_open_); }
+    // NEW: Consistency Stats Toggle
+    if (ImGui::Checkbox("Show Consistency Stats", &show_consistency_stats_)) { cvarManager->getCvar("ct_show_consistency").setValue(show_consistency_stats_); }
+    // NEW: Boost Stats Toggle
+    if (ImGui::Checkbox("Show Boost Stats", &show_boost_stats_)) { cvarManager->getCvar("ct_show_boost").setValue(show_boost_stats_); }
+
     ImGui::SameLine();
     if (ImGui::Button("Reset Current Session Stats")) { ResetSessionStats(); }
     ImGui::Spacing();
@@ -244,19 +313,26 @@ void ConsistencyTrainer::RenderSettings()
     if (training_session_stats_.empty()) { ImGui::Text("Load a training pack to see shot list."); }
     else
     {
-        ImGui::Columns(4, "session_stats_table", true);
+        ImGui::Columns(6, "session_stats_table", true); // EXPANDED COLUMNS
         ImGui::Text("Shot #"); ImGui::NextColumn();
         ImGui::Text("Successes"); ImGui::NextColumn();
         ImGui::Text("Attempts"); ImGui::NextColumn();
         ImGui::Text("Consistency"); ImGui::NextColumn();
+        ImGui::Text("Avg Boost (All)"); ImGui::NextColumn();
+        ImGui::Text("Avg Boost (Success)"); ImGui::NextColumn();
         ImGui::Separator();
         for (const auto& pair : training_session_stats_)
         {
+            float consistency = (pair.second.attempts > 0) ? (static_cast<float>(pair.second.successes) / pair.second.attempts * 100.0f) : 0.0f;
+            float avg_boost = (pair.second.attempts > 0) ? (pair.second.total_boost_used / pair.second.attempts) : 0.0f;
+            float avg_success_boost = (pair.second.successes > 0) ? (pair.second.total_successful_boost_used / pair.second.successes) : 0.0f;
+
             ImGui::Text("%d", pair.first + 1); ImGui::NextColumn();
             ImGui::Text("%d", pair.second.successes); ImGui::NextColumn();
             ImGui::Text("%d", pair.second.attempts); ImGui::NextColumn();
-            float shot_consistency = (pair.second.attempts > 0) ? (static_cast<float>(pair.second.successes) / pair.second.attempts * 100.0f) : 0.0f;
-            ImGui::Text("%.1f%%", shot_consistency); ImGui::NextColumn();
+            ImGui::Text("%.1f%%", consistency); ImGui::NextColumn();
+            ImGui::Text("%.1f", avg_boost); ImGui::NextColumn();
+            ImGui::Text("%.1f", avg_success_boost); ImGui::NextColumn();
         }
         ImGui::Columns(1);
     }
@@ -264,26 +340,86 @@ void ConsistencyTrainer::RenderSettings()
 
 void ConsistencyTrainer::SetImGuiContext(uintptr_t ctx) { ImGui::SetCurrentContext(reinterpret_cast<ImGuiContext*>(ctx)); }
 
+// MODIFIED: RenderWindow now manually draws lines based on state toggles
 void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
 {
     if (!is_plugin_enabled_ || !is_window_open_ || !IsInValidTraining()) { return; }
-    std::string draw_string;
+
     if (training_session_stats_.empty() || training_session_stats_.find(current_shot_index_) == training_session_stats_.end())
     {
-        draw_string = "Loading training pack...";
+        canvas.SetColor(255, 255, 255, 255);
+        canvas.SetPosition(Vector2{ text_pos_x_, text_pos_y_ });
+        canvas.DrawString("Loading training pack...", text_scale_, text_scale_);
+        return;
     }
-    else
-    {
-        ShotStats& current_stats = training_session_stats_.at(current_shot_index_);
-        float consistency = (current_stats.attempts > 0) ? (static_cast<float>(current_stats.successes) / current_stats.attempts * 100.0f) : 0.0f;
 
-        char buffer[256];
-        snprintf(buffer, sizeof(buffer),
-            "Current Shot: %d - Attempts: %d/%d - Successes: %d - Consistency: %.1f%%",
-            current_shot_index_ + 1, current_stats.attempts, max_attempts_per_shot_, current_stats.successes, consistency);
-        draw_string = buffer;
-    }
+    ShotStats& current_stats = training_session_stats_.at(current_shot_index_);
+
+    // Calculate values
+    float consistency = (current_stats.attempts > 0) ? (static_cast<float>(current_stats.successes) / current_stats.attempts * 100.0f) : 0.0f;
+    float avg_boost = (current_stats.attempts > 0) ? (current_stats.total_boost_used / current_stats.attempts) : 0.0f;
+    float avg_success_boost = (current_stats.successes > 0) ? (current_stats.total_successful_boost_used / current_stats.successes) : 0.0f;
+
+    // Line drawing variables
+    float line_height = 20.0f * text_scale_; // Rough estimate of line height based on scale
+    int current_y = text_pos_y_;
+    char buffer[128];
+
     canvas.SetColor(255, 255, 255, 255);
-    canvas.SetPosition(Vector2{ text_pos_x_, text_pos_y_ });
-    canvas.DrawString(draw_string, text_scale_, text_scale_);
+
+    // --- 1. Consistency Stats ---
+    if (show_consistency_stats_) {
+        // Line 1: Current Shot
+        snprintf(buffer, sizeof(buffer), "Current Shot: %d", current_shot_index_ + 1);
+        canvas.SetPosition(Vector2{ text_pos_x_, current_y });
+        canvas.DrawString(buffer, text_scale_, text_scale_);
+        current_y += line_height;
+
+        // Line 2: Attempts
+        snprintf(buffer, sizeof(buffer), "Attempts: %d/%d", current_stats.attempts, max_attempts_per_shot_);
+        canvas.SetPosition(Vector2{ text_pos_x_, current_y });
+        canvas.DrawString(buffer, text_scale_, text_scale_);
+        current_y += line_height;
+
+        // Line 3: Successes
+        snprintf(buffer, sizeof(buffer), "Successes: %d", current_stats.successes);
+        canvas.SetPosition(Vector2{ text_pos_x_, current_y });
+        canvas.DrawString(buffer, text_scale_, text_scale_);
+        current_y += line_height;
+
+        // Line 4: Consistency
+        snprintf(buffer, sizeof(buffer), "Consistency: %.1f%%", consistency);
+        canvas.SetPosition(Vector2{ text_pos_x_, current_y });
+        canvas.DrawString(buffer, text_scale_, text_scale_);
+        current_y += line_height * 0.75f; // Add a small gap after the group
+    }
+
+    // --- 2. Boost Stats ---
+    if (show_boost_stats_) {
+        if (show_consistency_stats_) {
+            current_y += line_height * 0.25f; // Add a small gap only if consistency stats were shown
+        }
+
+        // Line 5: Group Title
+        canvas.SetPosition(Vector2{ text_pos_x_, current_y });
+        canvas.DrawString("--- Boost Usage ---", text_scale_, text_scale_);
+        current_y += line_height;
+
+        // Line 6: Avg All
+        snprintf(buffer, sizeof(buffer), "Avg (All): %.1f", avg_boost);
+        canvas.SetPosition(Vector2{ text_pos_x_, current_y });
+        canvas.DrawString(buffer, text_scale_, text_scale_);
+        current_y += line_height;
+
+        // Line 7: Avg Success
+        snprintf(buffer, sizeof(buffer), "Avg (Success): %.1f", avg_success_boost);
+        canvas.SetPosition(Vector2{ text_pos_x_, current_y });
+        canvas.DrawString(buffer, text_scale_, text_scale_);
+        current_y += line_height;
+
+        // Line 8: Current Boost
+        snprintf(buffer, sizeof(buffer), "Boost Current: %.1f", current_attempt_boost_used_);
+        canvas.SetPosition(Vector2{ text_pos_x_, current_y });
+        canvas.DrawString(buffer, text_scale_, text_scale_);
+    }
 }

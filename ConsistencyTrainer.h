@@ -5,8 +5,10 @@
 #include "bakkesmod/plugin/PluginSettingsWindow.h"
 // Include only the specific wrappers we need to avoid circular dependencies.
 #include "bakkesmod/wrappers/CanvasWrapper.h"
-#include "bakkesmod/wrappers/Engine/ActorWrapper.h"
 
+// Corrected wrapper paths for necessary classes
+#include "bakkesmod/wrappers/GameObject/CarWrapper.h"
+#include "bakkesmod/wrappers/PlayerControllerWrapper.h" 
 
 #include <string>
 #include <map>
@@ -16,6 +18,9 @@ struct ShotStats
 {
 	int attempts = 0;
 	int successes = 0;
+	// Boost tracking variables
+	float total_boost_used = 0.0f;
+	float total_successful_boost_used = 0.0f;
 };
 
 class ConsistencyTrainer : public BakkesMod::Plugin::BakkesModPlugin, public BakkesMod::Plugin::PluginSettingsWindow
@@ -35,22 +40,24 @@ public:
 
 private:
 	// Game event hooks
-	void OnGoalScored(ActorWrapper caller, void* params, std::string eventName);
+	// *** FIX: Changed to simpler signature to match the HookEvent in the CPP ***
+	void OnGoalScored(void* params);
+
+	// Other hooks remain correct with ActorWrapper
 	void OnShotReset(ActorWrapper caller, void* params, std::string eventName);
 	void OnBallExploded(void* params);
 	void OnPlaylistIndexChanged(ActorWrapper caller, void* params, std::string eventName);
-	// void OnTrainingStarted(void* params); // REMOVED from .h
 	void OnShotAttempt(void* params);
-	bool IsShotFrozen();
+
+	// Boost usage tracking hook
+	void OnSetVehicleInput(std::string eventName);
+
 
 	// Core logic
+	bool IsShotFrozen();
 	void HandleAttempt(bool isSuccess);
-
-	// Initialization (called only on training start)
 	void InitializeSessionStats();
-	// Reset (called by button, zeros out stats)
 	void ResetSessionStats();
-
 	bool IsInValidTraining();
 	void AdvanceToNextShot();
 	void RepeatCurrentShot();
@@ -60,6 +67,15 @@ private:
 	int max_attempts_per_shot_ = 10;
 	int current_shot_index_ = 0;
 	bool plugin_initiated_reset_ = false;
+
+	// Boost tracker for the current attempt
+	float current_attempt_boost_used_ = 0.0f;
+	// Flag to track when a new shot starts (for boost reset)
+	bool is_new_shot_loaded_ = true;
+
+	// NEW: Stat Toggle States
+	bool show_consistency_stats_ = true;
+	bool show_boost_stats_ = false;
 
 	// GUI Window state
 	bool is_window_open_ = false;
