@@ -1,13 +1,15 @@
 #pragma once
 
 #include "pch.h"
-
 #include "bakkesmod/plugin/bakkesmodplugin.h"
-#include "bakkesmod/plugin/pluginwindow.h"
 #include "bakkesmod/plugin/PluginSettingsWindow.h"
+// Include only the specific wrappers we need to avoid circular dependencies.
+#include "bakkesmod/wrappers/CanvasWrapper.h"
+#include "bakkesmod/wrappers/Engine/ActorWrapper.h"
 
-#include "version.h"
-constexpr auto plugin_version = stringify(VERSION_MAJOR) "." stringify(VERSION_MINOR) "." stringify(VERSION_PATCH) "." stringify(VERSION_BUILD);
+
+#include <string>
+#include <map>
 
 // Struct to hold statistics for a single shot
 struct ShotStats
@@ -16,50 +18,54 @@ struct ShotStats
 	int successes = 0;
 };
 
-class ConsistencyTrainer : public BakkesMod::Plugin::BakkesModPlugin, public BakkesMod::Plugin::PluginSettingsWindow, public BakkesMod::Plugin::PluginWindow
+class ConsistencyTrainer : public BakkesMod::Plugin::BakkesModPlugin, public BakkesMod::Plugin::PluginSettingsWindow
 {
 public:
 	// Overrides from BakkesModPlugin
 	void onLoad() override;
 	void onUnload() override;
-	std::string GetPluginName() override;
 
 	// Overrides from PluginSettingsWindow
+	std::string GetPluginName() override;
 	void RenderSettings() override;
-
-	// Overrides from PluginWindow
-	void Render() override;
-	std::string GetMenuName() override;
-	std::string GetMenuTitle() override;
 	void SetImGuiContext(uintptr_t ctx) override;
-	bool ShouldBlockInput() override;
-	bool IsActiveOverlay() override;
-	void OnOpen() override;
-	void OnClose() override;
+
+	// Our custom rendering function
+	void RenderWindow(CanvasWrapper canvas);
 
 private:
 	// Game event hooks
-	void OnGoalScored(void* params);
-	void OnShotReset(void* params);
-	void OnTrainingShotChanged(void* params);
-	void OnTrainingStarted(void* params);
+	void OnGoalScored(ActorWrapper caller, void* params, std::string eventName);
+	void OnShotReset(ActorWrapper caller, void* params, std::string eventName);
+	void OnBallExploded(void* params);
+	void OnPlaylistIndexChanged(ActorWrapper caller, void* params, std::string eventName);
+	// void OnTrainingStarted(void* params); // REMOVED from .h
+	void OnShotAttempt(void* params);
 
 	// Core logic
-	void HandleAttemptFinished(bool isSuccess);
+	void HandleAttempt(bool isSuccess);
+
+	// Initialization (called only on training start)
+	void InitializeSessionStats();
+	// Reset (called by button, zeros out stats)
+	void ResetSessionStats();
+
+	bool IsInValidTraining();
 	void AdvanceToNextShot();
 	void RepeatCurrentShot();
-	void ResetSessionStats();
-	bool IsInValidTraining();
 
 	// Plugin state
 	bool is_plugin_enabled_ = false;
 	int max_attempts_per_shot_ = 10;
 	int current_shot_index_ = 0;
-
-	// Map to store stats for each shot index
-	std::map<int, ShotStats> training_session_stats_;
+	bool plugin_initiated_reset_ = false;
 
 	// GUI Window state
 	bool is_window_open_ = false;
-};
+	int text_pos_x_ = 100;
+	int text_pos_y_ = 200;
+	float text_scale_ = 2.0f;
 
+	// Map to store stats for each shot index
+	std::map<int, ShotStats> training_session_stats_;
+};

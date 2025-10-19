@@ -1,295 +1,277 @@
 #include "pch.h"
 #include "ConsistencyTrainer.h"
-
-BAKKESMOD_PLUGIN(ConsistencyTrainer, "Consistency Trainer", "1.0.0", PLUGINTYPE_CUSTOM_TRAINING)
-
 #include "imgui/imgui.h"
+// This master header includes all necessary wrapper definitions, including ActorWrapper and CanvasWrapper.
+BAKKESMOD_PLUGIN(ConsistencyTrainer, "Consistency Trainer", "1.0.0", PLUGINTYPE_CUSTOM_TRAINING)
 
 std::shared_ptr<CVarManagerWrapper> _globalCvarManager;
 
-// Called when the plugin is first loaded
+// A struct to represent the parameters passed by the SetCurrentActivePlaylistIndex event.
+struct PlaylistIndexParams {
+    int Index;
+};
+
 void ConsistencyTrainer::onLoad()
 {
-	_globalCvarManager = cvarManager;
+    _globalCvarManager = cvarManager;
 
-	// Register CVars (Console Variables) to store settings persistently
-	cvarManager->registerCvar("ct_plugin_enabled", "0", "Enable/Disable the Consistency Trainer plugin")
-		.addOnValueChanged([this](std::string, CVarWrapper cvar) {
-		is_plugin_enabled_ = cvar.getBoolValue();
-	});
-	cvarManager->registerCvar("ct_max_attempts", "10", "Max attempts per shot for consistency tracking")
-		.addOnValueChanged([this](std::string, CVarWrapper cvar) {
-		max_attempts_per_shot_ = cvar.getIntValue();
-	});
+    cvarManager->registerCvar("ct_plugin_enabled", "0", "Enable/Disable the Consistency Trainer plugin")
+        .addOnValueChanged([this](std::string, CVarWrapper cvar) { is_plugin_enabled_ = cvar.getBoolValue(); });
+    cvarManager->registerCvar("ct_max_attempts", "10", "Max attempts per shot for consistency tracking")
+        .addOnValueChanged([this](std::string, CVarWrapper cvar) { max_attempts_per_shot_ = cvar.getIntValue(); });
+    cvarManager->registerCvar("ct_text_x", "100", "X position of the stats text")
+        .addOnValueChanged([this](std::string, CVarWrapper cvar) { text_pos_x_ = cvar.getIntValue(); });
+    cvarManager->registerCvar("ct_text_y", "200", "Y position of the stats text")
+        .addOnValueChanged([this](std::string, CVarWrapper cvar) { text_pos_y_ = cvar.getIntValue(); });
+    cvarManager->registerCvar("ct_text_scale", "2.0", "Scale of the stats text")
+        .addOnValueChanged([this](std::string, CVarWrapper cvar) { text_scale_ = cvar.getFloatValue(); });
+    // *** NEW: Register CVar for Stats Window visibility ***
+    cvarManager->registerCvar("ct_window_open", "0", "Show/Hide the in-game stats window")
+        .addOnValueChanged([this](std::string, CVarWrapper cvar) { is_window_open_ = cvar.getBoolValue(); });
 
-	// Load initial values from the registered cvars
-	is_plugin_enabled_ = cvarManager->getCvar("ct_plugin_enabled").getBoolValue();
-	max_attempts_per_shot_ = cvarManager->getCvar("ct_max_attempts").getIntValue();
+    is_plugin_enabled_ = cvarManager->getCvar("ct_plugin_enabled").getBoolValue();
+    max_attempts_per_shot_ = cvarManager->getCvar("ct_max_attempts").getIntValue();
+    text_pos_x_ = cvarManager->getCvar("ct_text_x").getIntValue();
+    text_pos_y_ = cvarManager->getCvar("ct_text_y").getIntValue();
+    text_scale_ = cvarManager->getCvar("ct_text_scale").getFloatValue();
+    // *** NEW: Load state for Stats Window ***
+    is_window_open_ = cvarManager->getCvar("ct_window_open").getBoolValue();
 
-	// Hook into game events to monitor player actions
-	// Using lambdas to easily pass `this` instance to the member functions
-	gameWrapper->HookEvent("Function TAGame.GameEvent_Soccar_TA.OnGoalScored", [this](...) {
-		OnGoalScored(nullptr);
-	});
-	gameWrapper->HookEvent("Function TAGame.TrainingEditor_TA.ResetShot", [this](...) {
-		OnShotReset(nullptr);
-	});
-	gameWrapper->HookEvent("Function TAGame.GameEvent_TrainingEditor_TA.OnShotChanged", [this](...) {
-		OnTrainingShotChanged(nullptr);
-	});
-	gameWrapper->HookEvent("Function TAGame.GameEvent_TrainingEditor_TA.OnTrainingStarted", [this](...) {
-		OnTrainingStarted(nullptr);
-	});
+
+    // Event hooks
+    gameWrapper->HookEventWithCaller<ActorWrapper>("Function TAGame.Ball_TA.OnHitGoal",
+        std::bind(&ConsistencyTrainer::OnGoalScored, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+
+    gameWrapper->HookEventWithCallerPost<ActorWrapper>("Function TAGame.GameEvent_TrainingEditor_TA.OnResetShot",
+        std::bind(&ConsistencyTrainer::OnShotReset, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+
+    gameWrapper->HookEvent("Function TAGame.Ball_TA.EventExploded", [this](...) { OnBallExploded(nullptr); });
+
+    gameWrapper->HookEventWithCallerPost<ActorWrapper>("Function TAGame.TrainingEditorNavigation_TA.SetCurrentActivePlaylistIndex",
+        std::bind(&ConsistencyTrainer::OnPlaylistIndexChanged, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+
+    // Calls the robust initializer on training start
+    gameWrapper->HookEvent("Function TAGame.GameEvent_TrainingEditor_TA.StartPlayTest", [this](...) { InitializeSessionStats(); });
+
+    // Using the single-firing attempt event
+    gameWrapper->HookEvent("Function TAGame.TrainingEditorMetrics_TA.TrainingShotAttempt",
+        [this](...) { OnShotAttempt(nullptr); });
+
+
+    gameWrapper->RegisterDrawable(std::bind(&ConsistencyTrainer::RenderWindow, this, std::placeholders::_1));
+    // *** MODIFIED: Notifier now toggles the CVar for the settings window ***
+    cvarManager->registerNotifier("toggle_consistency_trainer", [this](...) {
+        cvarManager->getCvar("ct_window_open").setValue(!is_window_open_);
+    }, "Toggle the Consistency Trainer window", PERMISSION_ALL);
 }
 
-// Called when the plugin is unloaded
-void ConsistencyTrainer::onUnload()
+void ConsistencyTrainer::onUnload() { gameWrapper->UnregisterDrawables(); }
+
+// Safely initializes the session map ONLY when training starts 
+void ConsistencyTrainer::InitializeSessionStats()
 {
+    training_session_stats_.clear();
+    current_shot_index_ = 0;
+
+    if (gameWrapper->IsInCustomTraining())
+    {
+        ServerWrapper server = gameWrapper->GetCurrentGameState();
+        if (server.IsNull()) return;
+
+        TrainingEditorWrapper training_editor(server.memory_address);
+        if (training_editor.IsNull()) return;
+
+        int total_shots = training_editor.GetTotalRounds();
+        for (int i = 0; i < total_shots; ++i) {
+            training_session_stats_[i] = ShotStats();
+        }
+        current_shot_index_ = training_editor.GetRoundNum();
+    }
+    cvarManager->log("Session stats initialized.");
 }
 
-// Resets all stats for the current training session
+// *** FIX: Iterate and zero out values instead of clearing the map ***
 void ConsistencyTrainer::ResetSessionStats()
 {
-	training_session_stats_.clear();
-	// Set the shot index to the current one to start tracking from here
-	if (gameWrapper->IsInCustomTraining())
-	{
-		ServerWrapper server = gameWrapper->GetCurrentGameState();
-		if (!server.IsNull()) {
-			// The ServerWrapper for a custom training session can be treated as a TrainingEditorWrapper.
-			TrainingEditorWrapper training_editor(server.memory_address);
-			if (!training_editor.IsNull())
-			{
-				current_shot_index_ = training_editor.GetRoundNum();
-			}
-		}
-	}
+    // Iterate over the existing map and zero out the counts. Safe and fast.
+    for (auto& pair : training_session_stats_) {
+        pair.second.attempts = 0;
+        pair.second.successes = 0;
+    }
+    cvarManager->log("Session stats reset by user action (values zeroed).");
 }
 
 // --- Event Handlers ---
-
-// Called when a new training pack is loaded/started
-void ConsistencyTrainer::OnTrainingStarted(void* params)
+void ConsistencyTrainer::OnShotAttempt(void* params)
 {
-	ResetSessionStats();
+    if (!is_plugin_enabled_ || !IsInValidTraining()) return;
+
+    if (training_session_stats_.find(current_shot_index_) != training_session_stats_.end())
+    {
+        ShotStats& stats = training_session_stats_[current_shot_index_];
+        if (stats.attempts < max_attempts_per_shot_) {
+            stats.attempts++;
+            cvarManager->log("Attempt " + std::to_string(stats.attempts) + " started for shot " + std::to_string(current_shot_index_ + 1));
+        }
+    }
 }
 
-// Called when the player scores a goal
-void ConsistencyTrainer::OnGoalScored(void* params)
+void ConsistencyTrainer::OnGoalScored(ActorWrapper caller, void* params, std::string eventName)
 {
-	if (!is_plugin_enabled_ || !IsInValidTraining()) {
-		return;
-	}
-	HandleAttemptFinished(true);
+    if (!is_plugin_enabled_ || !IsInValidTraining()) return;
+    HandleAttempt(true);
 }
 
-// Called when the player resets the shot (e.g., by pressing the reset button)
-void ConsistencyTrainer::OnShotReset(void* params)
+void ConsistencyTrainer::OnShotReset(ActorWrapper caller, void* params, std::string eventName)
 {
-	if (!is_plugin_enabled_ || !IsInValidTraining()) {
-		return;
-	}
-	// A manual reset is considered a failed attempt
-	HandleAttemptFinished(false);
+    if (!is_plugin_enabled_ || !IsInValidTraining()) return;
+
+    if (plugin_initiated_reset_) {
+        plugin_initiated_reset_ = false;
+        return;
+    }
+
+    HandleAttempt(false);
 }
 
-// Called when the current shot changes (either by advancing or manual selection)
-void ConsistencyTrainer::OnTrainingShotChanged(void* params)
+void ConsistencyTrainer::OnBallExploded(void* params)
 {
-	if (IsInValidTraining()) {
-		// Do not reset stats here, as the user might be intentionally switching shots.
-		// Instead, just update the current shot index.
-		ServerWrapper server = gameWrapper->GetCurrentGameState();
-		if (!server.IsNull()) {
-			TrainingEditorWrapper training_editor(server.memory_address);
-			if (!training_editor.IsNull()) {
-				current_shot_index_ = training_editor.GetRoundNum();
-			}
-		}
-	}
+    if (!is_plugin_enabled_ || !IsInValidTraining()) return;
+    HandleAttempt(false);
+}
+
+void ConsistencyTrainer::OnPlaylistIndexChanged(ActorWrapper caller, void* params, std::string eventName)
+{
+    if (!is_plugin_enabled_ || params == nullptr) return;
+
+    PlaylistIndexParams* p = static_cast<PlaylistIndexParams*>(params);
+
+    if (current_shot_index_ != p->Index) {
+        current_shot_index_ = p->Index;
+        cvarManager->log("Playlist index changed to: " + std::to_string(current_shot_index_));
+    }
 }
 
 
 // --- Core Logic ---
+bool ConsistencyTrainer::IsInValidTraining() { return gameWrapper->IsInCustomTraining(); }
 
-// Determines if the plugin's logic should be active
-bool ConsistencyTrainer::IsInValidTraining()
+void ConsistencyTrainer::HandleAttempt(bool isSuccess)
 {
-	return gameWrapper->IsInCustomTraining();
+    // Ensure we have stats for the current shot
+    if (training_session_stats_.find(current_shot_index_) == training_session_stats_.end()) {
+        training_session_stats_[current_shot_index_] = ShotStats();
+    }
+
+    ShotStats& stats = training_session_stats_[current_shot_index_];
+
+    // We only proceed if an attempt was recorded (stats.attempts > 0)
+    if (stats.attempts > 0 && stats.attempts <= max_attempts_per_shot_) {
+
+        // 1. RECORD SUCCESS/FAILURE STATUS FIRST
+        if (isSuccess) {
+            stats.successes++;
+            cvarManager->log("SUCCESS recorded. Successes is now: " + std::to_string(stats.successes));
+        }
+        else {
+            cvarManager->log("FAILURE recorded for attempt " + std::to_string(stats.attempts));
+        }
+
+        // 2. CHECK ATTEMPT COUNT AND DECIDE NEXT ACTION
+        if (stats.attempts < max_attempts_per_shot_) {
+            gameWrapper->SetTimeout([this](...) { RepeatCurrentShot(); }, 0.05f);
+        }
+        else {
+            // Max attempts reached, advance to the next shot
+            gameWrapper->SetTimeout([this](...) { AdvanceToNextShot(); }, 0.05f);
+        }
+    }
+    else if (stats.attempts > max_attempts_per_shot_) {
+        // If attempts count somehow surpassed max, ensure we advance to the next shot
+        gameWrapper->SetTimeout([this](...) { AdvanceToNextShot(); }, 0.05f);
+    }
 }
 
-// Central logic for when an attempt is completed
-void ConsistencyTrainer::HandleAttemptFinished(bool isSuccess)
-{
-	ShotStats& stats = training_session_stats_[current_shot_index_];
-	stats.attempts++;
-	if (isSuccess)
-	{
-		stats.successes++;
-	}
-
-	if (stats.attempts >= max_attempts_per_shot_)
-	{
-		// If max attempts reached, move to the next shot after a short delay
-		gameWrapper->SetTimeout([this](...) {
-			AdvanceToNextShot();
-		}, 0.1f);
-	}
-	else if (isSuccess) // Only reset the shot if it was a success.
-	{
-		// If a goal was scored and more attempts remain, explicitly reset the shot to repeat it.
-		// A small delay prevents conflicts with the game's own goal scoring logic.
-		gameWrapper->SetTimeout([this](...) {
-			RepeatCurrentShot();
-		}, 0.1f);
-	}
-	// If it was a fail (isSuccess == false), we don't need to do anything.
-	// The user's manual reset has already put the game in the correct state.
-}
-
-void ConsistencyTrainer::AdvanceToNextShot()
-{
-	cvarManager->executeCommand("training_next");
+void ConsistencyTrainer::AdvanceToNextShot() {
+    plugin_initiated_reset_ = true;
+    cvarManager->executeCommand("training_next");
 }
 
 void ConsistencyTrainer::RepeatCurrentShot()
 {
-	cvarManager->executeCommand("training_reset");
+    plugin_initiated_reset_ = true;
+    cvarManager->executeCommand("shot_reset");
 }
 
 
-// --- ImGui Rendering ---
+// --- ImGui & Canvas Rendering ---
 
-void ConsistencyTrainer::SetImGuiContext(uintptr_t ctx)
-{
-	ImGui::SetCurrentContext(reinterpret_cast<ImGuiContext*>(ctx));
-}
+std::string ConsistencyTrainer::GetPluginName() { return "ConsistencyTrainer"; }
 
-// Main settings window (for the F2 plugins menu)
 void ConsistencyTrainer::RenderSettings()
 {
-	if (ImGui::Checkbox("Enable Plugin", &is_plugin_enabled_))
-	{
-		cvarManager->getCvar("ct_plugin_enabled").setValue(is_plugin_enabled_);
-	}
-
-	ImGui::Spacing();
-	ImGui::Text("Set the number of times to repeat each shot:");
-	if (ImGui::SliderInt("Max Attempts", &max_attempts_per_shot_, 1, 50))
-	{
-		cvarManager->getCvar("ct_max_attempts").setValue(max_attempts_per_shot_);
-	}
-
-	ImGui::Spacing();
-	ImGui::Separator();
-	ImGui::Spacing();
-
-	if (ImGui::Button("Reset Current Session Stats"))
-	{
-		ResetSessionStats();
-	}
-
-	ImGui::Separator();
-	ImGui::Spacing();
-
-	// -- STATS DISPLAY --
-	if (!IsInValidTraining()) {
-		ImGui::Text("Load a custom training pack to see stats.");
-	}
-	else {
-		// If no attempts have been made yet in the session, show a helpful message.
-		if (training_session_stats_.empty())
-		{
-			ImGui::Text("Make an attempt (score or reset) to start tracking stats.");
-		}
-		else
-		{
-			ImGui::Text("Current Shot: %d", current_shot_index_ + 1); // Display 1-based index
-
-			ShotStats& current_stats = training_session_stats_[current_shot_index_];
-			float consistency = (current_stats.attempts > 0) ? (static_cast<float>(current_stats.successes) / current_stats.attempts * 100.0f) : 0.0f;
-
-			ImGui::Text("Attempts: %d / %d", current_stats.attempts, max_attempts_per_shot_);
-			ImGui::Text("Successes: %d", current_stats.successes);
-			ImGui::Text("Consistency: %.1f%%", consistency);
-			ImGui::ProgressBar(static_cast<float>(current_stats.attempts) / max_attempts_per_shot_);
-
-			ImGui::Separator();
-			ImGui::Text("Overall Session Stats:");
-
-			// Use the older "Columns" API for compatibility
-			ImGui::Columns(4, "shot_stats_table", true);
-			ImGui::Text("Shot #"); ImGui::NextColumn();
-			ImGui::Text("Successes"); ImGui::NextColumn();
-			ImGui::Text("Attempts"); ImGui::NextColumn();
-			ImGui::Text("Consistency"); ImGui::NextColumn();
-			ImGui::Separator();
-
-			// Iterate through all tracked shots and display their stats
-			for (const auto& pair : training_session_stats_)
-			{
-				ImGui::Text("%d", pair.first + 1);
-				ImGui::NextColumn();
-
-				ImGui::Text("%d", pair.second.successes);
-				ImGui::NextColumn();
-
-				ImGui::Text("%d", pair.second.attempts);
-				ImGui::NextColumn();
-
-				float shot_consistency = (pair.second.attempts > 0) ? (static_cast<float>(pair.second.successes) / pair.second.attempts * 100.0f) : 0.0f;
-				ImGui::Text("%.1f%%", shot_consistency);
-				ImGui::NextColumn();
-			}
-
-			ImGui::Columns(1); // Important: reset to a single column
-		}
-	}
+    if (ImGui::Checkbox("Enable Plugin", &is_plugin_enabled_)) { cvarManager->getCvar("ct_plugin_enabled").setValue(is_plugin_enabled_); }
+    ImGui::Spacing();
+    if (ImGui::SliderInt("Max Attempts Per Shot", &max_attempts_per_shot_, 1, 50)) { cvarManager->getCvar("ct_max_attempts").setValue(max_attempts_per_shot_); }
+    ImGui::Spacing();
+    ImGui::Text("Display Settings:");
+    if (ImGui::SliderInt("Text X Position", &text_pos_x_, 0, 1920)) { cvarManager->getCvar("ct_text_x").setValue(text_pos_x_); }
+    if (ImGui::SliderInt("Text Y Position", &text_pos_y_, 0, 1080)) { cvarManager->getCvar("ct_text_y").setValue(text_pos_y_); }
+    if (ImGui::SliderFloat("Text Scale", &text_scale_, 1.0f, 10.0f)) { cvarManager->getCvar("ct_text_scale").setValue(text_scale_); }
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    // *** MODIFIED: Checkbox replaces the button for permanent setting ***
+    if (ImGui::Checkbox("Show In-Game Stats", &is_window_open_)) { cvarManager->getCvar("ct_window_open").setValue(is_window_open_); }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset Current Session Stats")) { ResetSessionStats(); }
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::Text("Overall Session Stats:");
+    if (training_session_stats_.empty()) { ImGui::Text("Load a training pack to see shot list."); }
+    else
+    {
+        ImGui::Columns(4, "session_stats_table", true);
+        ImGui::Text("Shot #"); ImGui::NextColumn();
+        ImGui::Text("Successes"); ImGui::NextColumn();
+        ImGui::Text("Attempts"); ImGui::NextColumn();
+        ImGui::Text("Consistency"); ImGui::NextColumn();
+        ImGui::Separator();
+        for (const auto& pair : training_session_stats_)
+        {
+            ImGui::Text("%d", pair.first + 1); ImGui::NextColumn();
+            ImGui::Text("%d", pair.second.successes); ImGui::NextColumn();
+            ImGui::Text("%d", pair.second.attempts); ImGui::NextColumn();
+            float shot_consistency = (pair.second.attempts > 0) ? (static_cast<float>(pair.second.successes) / pair.second.attempts * 100.0f) : 0.0f;
+            ImGui::Text("%.1f%%", shot_consistency); ImGui::NextColumn();
+        }
+        ImGui::Columns(1);
+    }
 }
 
-// This function is no longer used as we are not showing a separate window.
-void ConsistencyTrainer::Render()
+void ConsistencyTrainer::SetImGuiContext(uintptr_t ctx) { ImGui::SetCurrentContext(reinterpret_cast<ImGuiContext*>(ctx)); }
+
+void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
 {
+    if (!is_plugin_enabled_ || !is_window_open_ || !IsInValidTraining()) { return; }
+    std::string draw_string;
+    if (training_session_stats_.empty() || training_session_stats_.find(current_shot_index_) == training_session_stats_.end())
+    {
+        draw_string = "Loading training pack...";
+    }
+    else
+    {
+        ShotStats& current_stats = training_session_stats_.at(current_shot_index_);
+        float consistency = (current_stats.attempts > 0) ? (static_cast<float>(current_stats.successes) / current_stats.attempts * 100.0f) : 0.0f;
+
+        char buffer[256];
+        snprintf(buffer, sizeof(buffer),
+            "Current Shot: %d\nAttempts: %d/%d\nSuccesses: %d\nConsistency: %.1f%%",
+            current_shot_index_ + 1, current_stats.attempts, max_attempts_per_shot_, current_stats.successes, consistency);
+        draw_string = buffer;
+    }
+    canvas.SetColor(255, 255, 255, 255);
+    canvas.SetPosition(Vector2{ text_pos_x_, text_pos_y_ });
+    canvas.DrawString(draw_string, text_scale_, text_scale_);
 }
-
-
-// -- Functions to satisfy the PluginWindow interface --
-// These are kept to satisfy the class inheritance but are now disabled.
-
-std::string ConsistencyTrainer::GetPluginName()
-{
-	return "ConsistencyTrainer";
-}
-
-std::string ConsistencyTrainer::GetMenuName()
-{
-	return "ConsistencyTrainer";
-}
-
-std::string ConsistencyTrainer::GetMenuTitle()
-{
-	return "Consistency Trainer Stats";
-}
-
-void ConsistencyTrainer::OnOpen()
-{
-	is_window_open_ = false;
-}
-
-void ConsistencyTrainer::OnClose()
-{
-	is_window_open_ = false;
-}
-
-bool ConsistencyTrainer::IsActiveOverlay()
-{
-	// The separate window is never active.
-	return false;
-}
-
-bool ConsistencyTrainer::ShouldBlockInput()
-{
-	// The separate window should never block input.
-	return false;
-}
-
