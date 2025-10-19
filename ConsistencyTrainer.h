@@ -12,6 +12,7 @@
 
 #include <string>
 #include <map>
+#include <limits> // Required for initializing min_successful_boost_used
 
 // Struct to hold statistics for a single shot
 struct ShotStats
@@ -21,6 +22,8 @@ struct ShotStats
 	// Boost tracking variables
 	float total_boost_used = 0.0f;
 	float total_successful_boost_used = 0.0f;
+	// *** NEW: Tracks the least amount of boost used on a successful attempt ***
+	float min_successful_boost_used = std::numeric_limits<float>::max();
 };
 
 class ConsistencyTrainer : public BakkesMod::Plugin::BakkesModPlugin, public BakkesMod::Plugin::PluginSettingsWindow
@@ -40,10 +43,7 @@ public:
 
 private:
 	// Game event hooks
-	// *** FIX: Changed to simpler signature to match the HookEvent in the CPP ***
-	void OnGoalScored(void* params);
-
-	// Other hooks remain correct with ActorWrapper
+	void OnGoalScored(void* params); // Simplified due to HookEvent usage in CPP
 	void OnShotReset(ActorWrapper caller, void* params, std::string eventName);
 	void OnBallExploded(void* params);
 	void OnPlaylistIndexChanged(ActorWrapper caller, void* params, std::string eventName);

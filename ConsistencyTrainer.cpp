@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "ConsistencyTrainer.h"
 #include "imgui/imgui.h"
+#include <limits> // Required for std::numeric_limits
 // This master header includes all necessary wrapper definitions, including ActorWrapper and CanvasWrapper.
 BAKKESMOD_PLUGIN(ConsistencyTrainer, "Consistency Trainer", "1.0.0", PLUGINTYPE_CUSTOM_TRAINING)
 
@@ -49,14 +50,15 @@ void ConsistencyTrainer::onLoad()
 
 
     // Event hooks
-    // *** FIX: Hook updated to match the simplified handler signature ***
+    // Hook updated to match the simplified handler signature
     gameWrapper->HookEvent("Function TAGame.GameMetrics_TA.GoalScored",
         [this](...) { OnGoalScored(nullptr); }); // Only passing params
 
     gameWrapper->HookEventWithCallerPost<ActorWrapper>("Function TAGame.GameEvent_TrainingEditor_TA.OnResetShot",
         std::bind(&ConsistencyTrainer::OnShotReset, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 
-    gameWrapper->HookEvent("Function TAGame.Ball_TA.EventExploded", [this](...) { OnBallExploded(nullptr); });
+    // *** FIX: Removed OnBallExploded hook to prevent failure/success race condition ***
+    // gameWrapper->HookEvent("Function TAGame.Ball_TA.EventExploded", [this](...) { OnBallExploded(nullptr); });
 
     gameWrapper->HookEventWithCallerPost<ActorWrapper>("Function TAGame.TrainingEditorNavigation_TA.SetCurrentActivePlaylistIndex",
         std::bind(&ConsistencyTrainer::OnPlaylistIndexChanged, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
@@ -104,6 +106,8 @@ void ConsistencyTrainer::InitializeSessionStats()
         int total_shots = training_editor.GetTotalRounds();
         for (int i = 0; i < total_shots; ++i) {
             training_session_stats_[i] = ShotStats();
+            // Initialize min boost to max possible float value
+            training_session_stats_[i].min_successful_boost_used = std::numeric_limits<float>::max();
         }
         current_shot_index_ = training_editor.GetRoundNum();
     }
@@ -119,6 +123,8 @@ void ConsistencyTrainer::ResetSessionStats()
         pair.second.successes = 0;
         pair.second.total_boost_used = 0.0f; // Reset boost totals
         pair.second.total_successful_boost_used = 0.0f; // Reset successful boost totals
+        // Reset min boost to max possible float value
+        pair.second.min_successful_boost_used = std::numeric_limits<float>::max();
     }
     current_attempt_boost_used_ = 0.0f; // Reset boost tracker
     is_new_shot_loaded_ = true; // Mark as new shot
@@ -178,11 +184,15 @@ void ConsistencyTrainer::OnShotAttempt(void* params)
     }
 }
 
-// *** FIX: Changed function definition to match simplified header declaration ***
+// FIX: Changed function definition to match simplified header declaration
 void ConsistencyTrainer::OnGoalScored(void* params)
 {
     if (!is_plugin_enabled_ || !IsInValidTraining() || IsShotFrozen()) return;
-    HandleAttempt(true);
+
+    // Use a small timeout for success to let the game fully process the goal and prevent the reset handler from firing immediately.
+    gameWrapper->SetTimeout([this](...) {
+        HandleAttempt(true);
+    }, 0.01f);
 }
 
 void ConsistencyTrainer::OnShotReset(ActorWrapper caller, void* params, std::string eventName)
@@ -194,15 +204,20 @@ void ConsistencyTrainer::OnShotReset(ActorWrapper caller, void* params, std::str
         return;
     }
 
+    // The OnShotReset event is reliable for logging a fail/user reset in custom training.
+    // We now rely on the 0.01s delay in OnGoalScored to prevent double-logging.
     if (IsShotFrozen()) return;
 
-    HandleAttempt(false);
+    // Use a small timeout for failure too, to ensure we don't interfere with the delayed success logic.
+    gameWrapper->SetTimeout([this](...) {
+        HandleAttempt(false);
+    }, 0.01f);
 }
 
+// *** FIX: OnBallExploded handler removed from logic to prevent race condition ***
 void ConsistencyTrainer::OnBallExploded(void* params)
 {
-    if (!is_plugin_enabled_ || !IsInValidTraining() || IsShotFrozen()) return;
-    HandleAttempt(false);
+    // Do nothing. Reliance is now on OnGoalScored and OnShotReset.
 }
 
 void ConsistencyTrainer::OnPlaylistIndexChanged(ActorWrapper caller, void* params, std::string eventName)
@@ -243,6 +258,10 @@ void ConsistencyTrainer::HandleAttempt(bool isSuccess)
         if (isSuccess) {
             stats.successes++;
             stats.total_successful_boost_used += current_attempt_boost_used_;
+            // Check and update minimum boost used on a successful shot
+            if (current_attempt_boost_used_ < stats.min_successful_boost_used) {
+                stats.min_successful_boost_used = current_attempt_boost_used_;
+            }
             cvarManager->log("SUCCESS recorded. Boost Used: " + std::to_string(current_attempt_boost_used_));
         }
         else {
@@ -266,6 +285,7 @@ void ConsistencyTrainer::HandleAttempt(bool isSuccess)
         // If attempts count somehow surpassed max, ensure we advance to the next shot
         gameWrapper->SetTimeout([this](...) { AdvanceToNextShot(); }, 0.05f);
     }
+    // If stats.attempts is 0 (i.e. the array was cleared and HandleAttempt was called without OnShotAttempt), do nothing.
 }
 
 void ConsistencyTrainer::AdvanceToNextShot() {
@@ -313,19 +333,21 @@ void ConsistencyTrainer::RenderSettings()
     if (training_session_stats_.empty()) { ImGui::Text("Load a training pack to see shot list."); }
     else
     {
-        ImGui::Columns(6, "session_stats_table", true); // EXPANDED COLUMNS
+        ImGui::Columns(7, "session_stats_table", true); // EXPANDED COLUMNS
         ImGui::Text("Shot #"); ImGui::NextColumn();
         ImGui::Text("Successes"); ImGui::NextColumn();
         ImGui::Text("Attempts"); ImGui::NextColumn();
         ImGui::Text("Consistency"); ImGui::NextColumn();
         ImGui::Text("Avg Boost (All)"); ImGui::NextColumn();
         ImGui::Text("Avg Boost (Success)"); ImGui::NextColumn();
+        ImGui::Text("Min Boost (Success)"); ImGui::NextColumn(); // NEW COLUMN
         ImGui::Separator();
         for (const auto& pair : training_session_stats_)
         {
             float consistency = (pair.second.attempts > 0) ? (static_cast<float>(pair.second.successes) / pair.second.attempts * 100.0f) : 0.0f;
             float avg_boost = (pair.second.attempts > 0) ? (pair.second.total_boost_used / pair.second.attempts) : 0.0f;
             float avg_success_boost = (pair.second.successes > 0) ? (pair.second.total_successful_boost_used / pair.second.successes) : 0.0f;
+            float min_success_boost = (pair.second.min_successful_boost_used != std::numeric_limits<float>::max()) ? pair.second.min_successful_boost_used : 0.0f; // Display 0 if not set
 
             ImGui::Text("%d", pair.first + 1); ImGui::NextColumn();
             ImGui::Text("%d", pair.second.successes); ImGui::NextColumn();
@@ -333,6 +355,7 @@ void ConsistencyTrainer::RenderSettings()
             ImGui::Text("%.1f%%", consistency); ImGui::NextColumn();
             ImGui::Text("%.1f", avg_boost); ImGui::NextColumn();
             ImGui::Text("%.1f", avg_success_boost); ImGui::NextColumn();
+            ImGui::Text("%.1f", min_success_boost); ImGui::NextColumn(); // NEW VALUE
         }
         ImGui::Columns(1);
     }
@@ -359,6 +382,7 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
     float consistency = (current_stats.attempts > 0) ? (static_cast<float>(current_stats.successes) / current_stats.attempts * 100.0f) : 0.0f;
     float avg_boost = (current_stats.attempts > 0) ? (current_stats.total_boost_used / current_stats.attempts) : 0.0f;
     float avg_success_boost = (current_stats.successes > 0) ? (current_stats.total_successful_boost_used / current_stats.successes) : 0.0f;
+    float min_success_boost = (current_stats.min_successful_boost_used != std::numeric_limits<float>::max()) ? current_stats.min_successful_boost_used : 0.0f;
 
     // Line drawing variables
     float line_height = 20.0f * text_scale_; // Rough estimate of line height based on scale
@@ -417,7 +441,13 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
         canvas.DrawString(buffer, text_scale_, text_scale_);
         current_y += line_height;
 
-        // Line 8: Current Boost
+        // Line 8: Min Success *** NEW VALUE ***
+        snprintf(buffer, sizeof(buffer), "Min (Success): %.1f", min_success_boost);
+        canvas.SetPosition(Vector2{ text_pos_x_, current_y });
+        canvas.DrawString(buffer, text_scale_, text_scale_);
+        current_y += line_height;
+
+        // Line 9: Current Boost
         snprintf(buffer, sizeof(buffer), "Boost Current: %.1f", current_attempt_boost_used_);
         canvas.SetPosition(Vector2{ text_pos_x_, current_y });
         canvas.DrawString(buffer, text_scale_, text_scale_);
