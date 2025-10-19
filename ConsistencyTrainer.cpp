@@ -25,7 +25,7 @@ void ConsistencyTrainer::onLoad()
         .addOnValueChanged([this](std::string, CVarWrapper cvar) { text_pos_y_ = cvar.getIntValue(); });
     cvarManager->registerCvar("ct_text_scale", "2.0", "Scale of the stats text")
         .addOnValueChanged([this](std::string, CVarWrapper cvar) { text_scale_ = cvar.getFloatValue(); });
-    // *** NEW: Register CVar for Stats Window visibility ***
+    // Register CVar for Stats Window visibility
     cvarManager->registerCvar("ct_window_open", "0", "Show/Hide the in-game stats window")
         .addOnValueChanged([this](std::string, CVarWrapper cvar) { is_window_open_ = cvar.getBoolValue(); });
 
@@ -34,12 +34,12 @@ void ConsistencyTrainer::onLoad()
     text_pos_x_ = cvarManager->getCvar("ct_text_x").getIntValue();
     text_pos_y_ = cvarManager->getCvar("ct_text_y").getIntValue();
     text_scale_ = cvarManager->getCvar("ct_text_scale").getFloatValue();
-    // *** NEW: Load state for Stats Window ***
+    // Load state for Stats Window
     is_window_open_ = cvarManager->getCvar("ct_window_open").getBoolValue();
 
 
     // Event hooks
-    gameWrapper->HookEventWithCaller<ActorWrapper>("Function TAGame.Ball_TA.OnHitGoal",
+    gameWrapper->HookEventWithCaller<ActorWrapper>("Function TAGame.GameMetrics_TA.GoalScored",
         std::bind(&ConsistencyTrainer::OnGoalScored, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 
     gameWrapper->HookEventWithCallerPost<ActorWrapper>("Function TAGame.GameEvent_TrainingEditor_TA.OnResetShot",
@@ -59,7 +59,7 @@ void ConsistencyTrainer::onLoad()
 
 
     gameWrapper->RegisterDrawable(std::bind(&ConsistencyTrainer::RenderWindow, this, std::placeholders::_1));
-    // *** MODIFIED: Notifier now toggles the CVar for the settings window ***
+    // Notifier now toggles the CVar for the settings window
     cvarManager->registerNotifier("toggle_consistency_trainer", [this](...) {
         cvarManager->getCvar("ct_window_open").setValue(!is_window_open_);
     }, "Toggle the Consistency Trainer window", PERMISSION_ALL);
@@ -90,7 +90,7 @@ void ConsistencyTrainer::InitializeSessionStats()
     cvarManager->log("Session stats initialized.");
 }
 
-// *** FIX: Iterate and zero out values instead of clearing the map ***
+// FIX: Iterate and zero out values instead of clearing the map
 void ConsistencyTrainer::ResetSessionStats()
 {
     // Iterate over the existing map and zero out the counts. Safe and fast.
@@ -101,10 +101,20 @@ void ConsistencyTrainer::ResetSessionStats()
     cvarManager->log("Session stats reset by user action (values zeroed).");
 }
 
+// *** NEW: Gatekeeper check for when max attempts are reached ***
+bool ConsistencyTrainer::IsShotFrozen()
+{
+    if (training_session_stats_.find(current_shot_index_) == training_session_stats_.end()) return true;
+
+    ShotStats& stats = training_session_stats_[current_shot_index_];
+    return stats.attempts >= max_attempts_per_shot_;
+}
+
+
 // --- Event Handlers ---
 void ConsistencyTrainer::OnShotAttempt(void* params)
 {
-    if (!is_plugin_enabled_ || !IsInValidTraining()) return;
+    if (!is_plugin_enabled_ || !IsInValidTraining() || IsShotFrozen()) return; // *** FREEZE CHECK ***
 
     if (training_session_stats_.find(current_shot_index_) != training_session_stats_.end())
     {
@@ -118,7 +128,7 @@ void ConsistencyTrainer::OnShotAttempt(void* params)
 
 void ConsistencyTrainer::OnGoalScored(ActorWrapper caller, void* params, std::string eventName)
 {
-    if (!is_plugin_enabled_ || !IsInValidTraining()) return;
+    if (!is_plugin_enabled_ || !IsInValidTraining() || IsShotFrozen()) return; // *** FREEZE CHECK ***
     HandleAttempt(true);
 }
 
@@ -131,12 +141,14 @@ void ConsistencyTrainer::OnShotReset(ActorWrapper caller, void* params, std::str
         return;
     }
 
+    if (IsShotFrozen()) return; // *** FREEZE CHECK ***
+
     HandleAttempt(false);
 }
 
 void ConsistencyTrainer::OnBallExploded(void* params)
 {
-    if (!is_plugin_enabled_ || !IsInValidTraining()) return;
+    if (!is_plugin_enabled_ || !IsInValidTraining() || IsShotFrozen()) return; // *** FREEZE CHECK ***
     HandleAttempt(false);
 }
 
@@ -221,7 +233,7 @@ void ConsistencyTrainer::RenderSettings()
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-    // *** MODIFIED: Checkbox replaces the button for permanent setting ***
+    // Checkbox for permanent setting
     if (ImGui::Checkbox("Show In-Game Stats", &is_window_open_)) { cvarManager->getCvar("ct_window_open").setValue(is_window_open_); }
     ImGui::SameLine();
     if (ImGui::Button("Reset Current Session Stats")) { ResetSessionStats(); }
@@ -267,7 +279,7 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
 
         char buffer[256];
         snprintf(buffer, sizeof(buffer),
-            "Current Shot: %d\nAttempts: %d/%d\nSuccesses: %d\nConsistency: %.1f%%",
+            "Current Shot: %d - Attempts: %d/%d - Successes: %d - Consistency: %.1f%%",
             current_shot_index_ + 1, current_stats.attempts, max_attempts_per_shot_, current_stats.successes, consistency);
         draw_string = buffer;
     }

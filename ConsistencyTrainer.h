@@ -41,6 +41,7 @@ private:
 	void OnPlaylistIndexChanged(ActorWrapper caller, void* params, std::string eventName);
 	// void OnTrainingStarted(void* params); // REMOVED from .h
 	void OnShotAttempt(void* params);
+	bool IsShotFrozen();
 
 	// Core logic
 	void HandleAttempt(bool isSuccess);
