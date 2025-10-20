@@ -351,8 +351,7 @@ void ConsistencyTrainer::ResetCurrentShotSessionStats(ShotStats& stats)
 
 /**
  * @brief Updates the lifetime best stats based on the current session's performance.
- * * This function is ONLY responsible for updating Success count and Boost metrics,
- * * as lifetime_attempts_at_best is set in OnShotAttempt.
+ * * Implements logic: Update Best Attempts always, Update Success count if higher, and use boost for tie-breakers.
  */
 void ConsistencyTrainer::UpdateLifetimeBest(ShotStats& stats) {
 
@@ -367,49 +366,53 @@ void ConsistencyTrainer::UpdateLifetimeBest(ShotStats& stats) {
     // 2. Update Consistency & Associated Boost Metrics
     if (stats.attempts > 0) {
 
-        // CRITICAL CHECK: We only update consistency if the current run matches the recorded best length.
-        bool attempts_matched_best_length = (stats.attempts == stats.lifetime_attempts_at_best);
+        bool attempts_increased = (stats.attempts > stats.lifetime_attempts_at_best);
+        bool success_improved = (stats.successes > stats.lifetime_best_successes);
 
-        // If the current attempt count is NOT the longest recorded run, we cannot update the best success score yet.
-        if (!attempts_matched_best_length) {
-            return;
+        // --- PHASE 1: Update Best Attempts (Longest Run) ---
+        if (attempts_increased) {
+            // Rule: Update the longest run length and record the current success/boost as the new base.
+            stats.lifetime_attempts_at_best = stats.attempts;
+            stats.lifetime_best_successes = stats.successes;
+
+            // Update associated boost metrics
+            stats.lifetime_total_boost_at_best = stats.total_boost_used;
+            stats.lifetime_total_successful_boost_at_best = stats.total_successful_boost_used;
+            cvarManager->log("New Lifetime Best Run Length (Attempts/Success) for Shot " + std::to_string(current_shot_index_ + 1) + ": " + std::to_string(stats.attempts) + "/" + std::to_string(stats.successes));
         }
 
-        // --- Consistency and Tie-breakers (Only when attempts MATCH best length) ---
+        // --- PHASE 2: Update Best Success and Tie-breakers ---
+        // This is checked if a longer run WASN'T just recorded, OR if the attempt length matches the current best.
 
-        bool should_update_consistency = false;
-        bool should_update_boost_only = false;
-
-        // Rule 2A: Update if strictly better success count.
-        if (stats.successes > stats.lifetime_best_successes) {
-            should_update_consistency = true;
-        }
-        // Rule 2B: Update if performance is matched (Success count is tied).
-        else if (stats.successes == stats.lifetime_best_successes)
-        {
-            // Tie-breaker: Check if current total boost used (for all attempts in the run) is lower than the recorded best.
-            float current_total_boost = stats.total_boost_used;
-            float best_total_boost = stats.lifetime_total_boost_at_best;
-
-            if (current_total_boost < best_total_boost) {
-                // If we found a run with the same length/success count but less total boost, update the boost metrics.
-                should_update_boost_only = true;
+        if (success_improved) {
+            // Rule: Update Best Success regardless of run length (e.g., 5/7 beats 4/10).
+            if (stats.successes > stats.lifetime_best_successes) {
+                // If the success count is strictly higher, we take the WHOLE set of metrics for this run.
+                stats.lifetime_best_successes = stats.successes;
+                stats.lifetime_attempts_at_best = stats.attempts;
+                stats.lifetime_total_boost_at_best = stats.total_boost_used;
+                stats.lifetime_total_successful_boost_at_best = stats.total_successful_boost_used;
+                cvarManager->log("New Absolute Best Success Count for Shot " + std::to_string(current_shot_index_ + 1) + ": " + std::to_string(stats.successes) + "/" + std::to_string(stats.attempts));
             }
         }
+        else if (stats.successes == stats.lifetime_best_successes)
+        {
+            // Tie-breaker: If success count is equal, we must ensure the run length is AT LEAST equal 
+            // before using boost as a tie-breaker.
+            if (stats.attempts >= stats.lifetime_attempts_at_best) {
 
-        // --- APPLY CONSISTENCY UPDATES ---
-        if (should_update_consistency) {
-            // Update Success and associated Boost metrics
-            stats.lifetime_best_successes = stats.successes;
-            stats.lifetime_total_boost_at_best = stats.total_boost_used;
-            stats.lifetime_total_successful_boost_at_best = stats.total_successful_boost_used;
-            cvarManager->log("New Lifetime Best Success for Shot " + std::to_string(current_shot_index_ + 1) + ": " + std::to_string(stats.successes) + "/" + std::to_string(stats.attempts));
-        }
-        else if (should_update_boost_only) {
-            // Update ONLY boost metrics (Tie-breaker for matching consistency)
-            stats.lifetime_total_boost_at_best = stats.total_boost_used;
-            stats.lifetime_total_successful_boost_at_best = stats.total_successful_boost_used;
-            cvarManager->log("Boost Tie-breaker Update for Shot " + std::to_string(current_shot_index_ + 1) + ". Same success count, but less total boost used.");
+                float current_total_boost = stats.total_boost_used;
+                float best_total_boost = stats.lifetime_total_boost_at_best;
+
+                // Check for strictly better boost performance
+                if (current_total_boost < best_total_boost) {
+                    // Update ONLY boost metrics, and set attempts_at_best to current attempts if it was previously less
+                    stats.lifetime_attempts_at_best = stats.attempts;
+                    stats.lifetime_total_boost_at_best = current_total_boost;
+                    stats.lifetime_total_successful_boost_at_best = stats.total_successful_boost_used;
+                    cvarManager->log("Boost Tie-breaker Update for Shot " + std::to_string(current_shot_index_ + 1) + ". Same success count, but less total boost used.");
+                }
+            }
         }
     }
 }
@@ -466,13 +469,13 @@ void ConsistencyTrainer::OnShotAttempt(void* params)
     // CRITICAL FIX: Robust counter logic
     if (stats.attempts < max_attempts_per_shot_) {
 
-        // *** FIX 1: Update Best Attempts (Longest Run) on attempt start ***
+        // *** Update Best Attempts (Longest Run) on attempt start ***
         // Rule: I want the best attempts to update any time the current attempts goes above the best attempts.
         if (stats.attempts + 1 > stats.lifetime_attempts_at_best) {
             stats.lifetime_attempts_at_best = stats.attempts + 1;
 
-            // NOTE: We don't touch lifetime_best_successes here; it will be updated in HandleAttempt 
-            // once a scoring outcome is available for this new, longer run length.
+            // NOTE: We only update the attempts length here. The corresponding success/boost metrics will be
+            // updated in UpdateLifetimeBest when the outcome is known.
             cvarManager->log("New Lifetime Best Run Length (Attempts) set to: " + std::to_string(stats.lifetime_attempts_at_best) + " upon shot start.");
         }
 
@@ -585,7 +588,7 @@ void ConsistencyTrainer::HandleAttempt(bool isSuccess)
         return;
     }
 
-    ShotStats& stats = training_session_stats_[current_shot_index_];
+    ShotStats& stats = training_session_stats_.at(current_shot_index_);
 
     // Check if the current attempt number is 0. This means HandleAttempt fired but OnShotAttempt hasn't set the counter to 1 yet.
     if (stats.attempts == 0) {
@@ -698,12 +701,17 @@ void ConsistencyTrainer::RenderSettings()
         for (const auto& pair : training_session_stats_)
         {
             // FIX: Corrected calculation for current session consistency
-            float consistency = (pair.second.attempts > 0) ? (static_cast<float>(pair.second.successes) / pair.second.attempts * 100.0f) : 0.0f;
-            float best_consistency = (pair.second.lifetime_attempts_at_best > 0) ? (static_cast<float>(pair.second.lifetime_best_successes) / pair.second.lifetime_attempts_at_best * 100.0f) : 0.0f;
+            float current_successes_f = static_cast<float>(pair.second.successes);
+            float current_attempts_f = static_cast<float>(pair.second.attempts);
+            float best_successes_f = static_cast<float>(pair.second.lifetime_best_successes);
+            float best_attempts_f = static_cast<float>(pair.second.lifetime_attempts_at_best);
+
+            float consistency = (pair.second.attempts > 0) ? (current_successes_f / current_attempts_f * 100.0f) : 0.0f;
+            float best_consistency = (pair.second.lifetime_attempts_at_best > 0) ? (best_successes_f / best_attempts_f * 100.0f) : 0.0f;
 
             float avg_boost = (pair.second.attempts > 0) ? (pair.second.total_boost_used / pair.second.attempts) : 0.0f;
             float avg_success_boost = (pair.second.successes > 0) ? (pair.second.total_successful_boost_used / pair.second.successes) : 0.0f;
-            float avg_success_boost_best_consist = (pair.second.lifetime_attempts_at_best > 0 && pair.second.lifetime_best_successes > 0) ? (pair.second.lifetime_total_successful_boost_at_best / pair.second.lifetime_best_successes) : 0.0f;
+            float avg_success_boost_best_consist = (pair.second.lifetime_attempts_at_best > 0 && pair.second.lifetime_best_successes > 0) ? (pair.second.lifetime_total_successful_boost_at_best / best_successes_f) : 0.0f;
 
             float min_success_boost_curr = (pair.second.min_successful_boost_used != std::numeric_limits<float>::max()) ? pair.second.min_successful_boost_used : 0.0f;
             float min_success_boost_life = (pair.second.lifetime_min_boost != std::numeric_limits<float>::max()) ? pair.second.lifetime_min_boost : 0.0f;
@@ -730,7 +738,7 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
 {
     if (!is_plugin_enabled_ || !is_window_open_ || !IsInValidTraining()) { return; }
 
-    // *** FIX 2: Relaxed check to allow drawing if the current shot index has a map entry ***
+    // *** Allow display if a map entry exists, even if initial session stats haven't fired yet ***
     if (training_session_stats_.find(current_shot_index_) == training_session_stats_.end())
     {
         canvas.SetColor(255, 255, 255, 255);
@@ -742,7 +750,7 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
     ShotStats& current_stats = training_session_stats_.at(current_shot_index_);
 
     // Calculate values
-    // FIX 3: Ensure explicit casting for floating point division for consistency.
+    // Explicit casting for floating point division for consistency.
     float current_successes_f = static_cast<float>(current_stats.successes);
     float current_attempts_f = static_cast<float>(current_stats.attempts);
     float best_successes_f = static_cast<float>(current_stats.lifetime_best_successes);
