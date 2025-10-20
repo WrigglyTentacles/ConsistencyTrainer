@@ -38,6 +38,9 @@ using ShotPackStats = std::map<int, ShotStats>;
 // This map holds all ShotPacks, keyed by the Training Pack Code (string).
 using PersistentData = std::map<std::string, ShotPackStats>;
 
+// Forward declaration of CVarManagerWrapper and GameWrapper to resolve linker errors
+class CVarManagerWrapper;
+class GameWrapper;
 
 class ConsistencyTrainer : public BakkesMod::Plugin::BakkesModPlugin, public BakkesMod::Plugin::PluginSettingsWindow
 {
@@ -55,6 +58,9 @@ public:
     void RenderWindow(CanvasWrapper canvas);
 
 private:
+    // Persistence file path storage
+    std::string dataFilePath_; // ?? ADDED: Member to store the absolute file path
+
     // Persistence methods use string serialization
     void LoadPersistentStats();
     void SavePersistentStats();
@@ -62,6 +68,9 @@ private:
     std::string GetCurrentPackID();
     // NEW: Helper to get the total number of shots for index correction
     int GetTotalRounds();
+
+    // ?? NEW: Method to clear lifetime stats for the current pack
+    void ClearLifetimeStats();
 
     // Game event hooks
     void OnGoalScored(void* params);
@@ -100,9 +109,6 @@ private:
     // The container for ALL lifetime data
     PersistentData global_pack_stats_;
     std::string current_pack_id_ = "";
-
-    // ?? CRITICAL ADDITION: Absolute file path for persistence
-    std::string dataFilePath_;
 
     // GUI Window state
     bool is_window_open_ = false;

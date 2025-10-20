@@ -21,9 +21,9 @@
 std::string SerializeStats(const PersistentData& data) {
     std::stringstream ss;
     for (const auto& pack_pair : data) {
-        const std::string& pack_id = pack_pair.first;
+        // SYNTAX FIX: Changed 'pair.second' to 'pack_pair.second'
         for (const auto& shot_pair : pack_pair.second) {
-            ss << pack_id << "|"
+            ss << pack_pair.first << "|" // Use pack_pair.first (PackID)
                 << shot_pair.first << "|"
                 << shot_pair.second.lifetime_best_successes << "|"
                 << shot_pair.second.lifetime_attempts_at_best << "|" // <-- Persist the attempts count
@@ -282,6 +282,33 @@ void ConsistencyTrainer::SavePersistentStats() {
     }
 }
 
+// ?? NEW: Function to clear the lifetime stats for the current pack
+void ConsistencyTrainer::ClearLifetimeStats() {
+    if (current_pack_id_.empty()) {
+        cvarManager->log("Cannot reset lifetime stats: No active training pack loaded.");
+        return;
+    }
+
+    // 1. Clear the lifetime data from the global map
+    if (global_pack_stats_.count(current_pack_id_)) {
+        global_pack_stats_.erase(current_pack_id_);
+        cvarManager->log("Lifetime stats cleared for pack: " + current_pack_id_);
+    }
+    else {
+        cvarManager->log("No saved lifetime stats found for pack: " + current_pack_id_ + ".");
+    }
+
+    // 2. Clear the current session stats (which are derived from lifetime stats on load)
+    training_session_stats_.clear();
+
+    // 3. Force re-initialization of the session (will use fresh defaults for the pack)
+    InitializeSessionStats();
+
+    // 4. Save the global map immediately to persist the deletion
+    SavePersistentStats();
+}
+
+
 // Safely initializes the session map ONLY when training starts
 void ConsistencyTrainer::InitializeSessionStats()
 {
@@ -324,7 +351,7 @@ void ConsistencyTrainer::InitializeSessionStats()
             }
 
             // CRITICAL FIX: Define the reference here to avoid scope error (E0020/C2065)
-            ShotStats& stats = training_session_stats_[i];
+            ShotStats& stats = training_session_stats_.at(i);
 
             // For existing (and newly created) shots, reset session-specific stats
             stats.attempts = 0;
@@ -333,8 +360,10 @@ void ConsistencyTrainer::InitializeSessionStats()
             stats.total_successful_boost_used = 0.0f;
             stats.min_successful_boost_used = std::numeric_limits<float>::max();
 
-            // FIX: Re-initialize the lifetime-dependent variable if missing (e.g., loaded legacy data)
-            if (stats.lifetime_min_boost == 0.0f) {
+            // ?? FIX: Check the loaded lifetime_min_boost for corruption.
+            // If it is near zero (0.0f) or exactly the massive sentinel value, we keep the sentinel state.
+            // If it's corrupted to a value like 0.0f, reset it to the MAX sentinel value.
+            if (stats.lifetime_min_boost < 1.0f) {
                 stats.lifetime_min_boost = std::numeric_limits<float>::max();
             }
         }
@@ -670,7 +699,6 @@ void ConsistencyTrainer::HandleAttempt(bool isSuccess)
         // Max attempts reached (e.g., attempts is 10). Auto-reset session stats and repeat shot.
 
         // Reset the current session stats (attempts, successes, total boost) to zero.
-        // This ensures OnShotAttempt increments the counter back to 1 for the next run.
         ResetCurrentShotSessionStats(stats);
 
         // Then repeat the shot immediately to start the new session run
@@ -712,6 +740,11 @@ void ConsistencyTrainer::RenderSettings()
 
     ImGui::SameLine();
     if (ImGui::Button("Reset Current Session Stats")) { ResetSessionStats(); }
+
+    // ?? NEW BUTTON: Reset Lifetime Stats for current pack
+    ImGui::SameLine();
+    if (ImGui::Button("Reset Lifetime Stats")) { ClearLifetimeStats(); }
+
     ImGui::Spacing();
     // NEW: Manual Save button remains for user convenience/debug
     if (ImGui::Button("Manually Save Lifetime Stats")) { SavePersistentStats(); }
@@ -749,7 +782,13 @@ void ConsistencyTrainer::RenderSettings()
             float avg_success_boost = (pair.second.successes > 0) ? (pair.second.total_successful_boost_used / pair.second.successes) : 0.0f;
             float avg_success_boost_best_consist = (pair.second.lifetime_attempts_at_best > 0 && pair.second.lifetime_best_successes > 0) ? (pair.second.lifetime_total_successful_boost_at_best / best_successes_f) : 0.0f;
             float min_success_boost_curr = (pair.second.min_successful_boost_used != std::numeric_limits<float>::max()) ? pair.second.min_successful_boost_used : 0.0f;
-            float min_success_boost_life = (pair.second.lifetime_min_boost != std::numeric_limits<float>::max()) ? pair.second.lifetime_min_boost : 0.0f;
+
+            // ?? DISPLAY FIX: Check for the sentinel value (max float) before displaying
+            float sentinel = std::numeric_limits<float>::max();
+            bool is_life_min_boost_set = pair.second.lifetime_min_boost < sentinel;
+
+            // Use a specific value for display only, not for the actual comparison
+            float min_success_boost_life = is_life_min_boost_set ? pair.second.lifetime_min_boost : 0.0f;
 
             ImGui::Text("%d", pair.first + 1); ImGui::NextColumn();
             // Display Current/Lifetime Best Successes
@@ -760,7 +799,14 @@ void ConsistencyTrainer::RenderSettings()
             ImGui::Text("%.1f%%/%.1f%%", consistency, best_consistency); ImGui::NextColumn(); // MODIFIED ROW
             ImGui::Text("%.1f", avg_boost); ImGui::NextColumn();
             ImGui::Text("%.1f/%.1f", avg_success_boost, avg_success_boost_best_consist); ImGui::NextColumn();
-            ImGui::Text("%.1f/%.1f", min_success_boost_curr, min_success_boost_life); ImGui::NextColumn();
+
+            // ?? DISPLAY FIX: Use a ternary operator to show "N/A" if the sentinel value is present.
+            if (is_life_min_boost_set) {
+                ImGui::Text("%.1f/%.1f", min_success_boost_curr, min_success_boost_life); ImGui::NextColumn();
+            }
+            else {
+                ImGui::Text("%.1f/—", min_success_boost_curr); ImGui::NextColumn();
+            }
         }
         ImGui::Columns(1);
     }
@@ -798,8 +844,13 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
     float avg_success_boost = (current_stats.successes > 0) ? (current_stats.total_successful_boost_used / current_stats.successes) : 0.0f;
     float avg_success_boost_best_consist = (current_stats.lifetime_attempts_at_best > 0 && current_stats.lifetime_best_successes > 0) ? (current_stats.lifetime_total_successful_boost_at_best / best_successes_f) : 0.0f;
     float min_success_boost_curr = (current_stats.min_successful_boost_used != std::numeric_limits<float>::max()) ? current_stats.min_successful_boost_used : 0.0f;
-    float min_success_boost_life = (current_stats.lifetime_min_boost != std::numeric_limits<float>::max()) ? current_stats.lifetime_min_boost : 0.0f;
 
+    // ?? DISPLAY FIX: Check for the sentinel value before displaying
+    float sentinel = std::numeric_limits<float>::max();
+    bool is_life_min_boost_set = current_stats.lifetime_min_boost < sentinel;
+
+    // Use a specific value for display only
+    float min_success_boost_life = is_life_min_boost_set ? current_stats.lifetime_min_boost : 0.0f;
 
     // Line drawing variables
     float line_height = 20.0f * text_scale_; // Rough estimate of line height based on scale
@@ -859,7 +910,14 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
         current_y += line_height;
 
         // Line 8: Min Success (Current vs. Lifetime Best)
-        snprintf(buffer, sizeof(buffer), "Min (S): %.1f / Best: %.1f", min_success_boost_curr, min_success_boost_life);
+        // ?? DISPLAY FIX in Canvas: Use '—' for Best if the sentinel value is present
+        if (is_life_min_boost_set) {
+            snprintf(buffer, sizeof(buffer), "Min (S): %.1f / Best: %.1f", min_success_boost_curr, min_success_boost_life);
+        }
+        else {
+            snprintf(buffer, sizeof(buffer), "Min (S): %.1f / Best: —", min_success_boost_curr);
+        }
+
         canvas.SetPosition(Vector2{ text_pos_x_, current_y });
         canvas.DrawString(buffer, text_scale_, text_scale_);
         current_y += line_height;
