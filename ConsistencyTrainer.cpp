@@ -7,15 +7,25 @@
 #include <iostream> 
 
 // Helper functions for basic serialization (using a simple, parsable format)
+
+/**
+ * @brief Serializes the persistent data into a string format.
+ * * New structure (7 segments): PackID|ShotIndex|LBS|LBA|LBTB|LBTSB|LMB;...
+ * LBS: lifetime_best_successes
+ * LBA: lifetime_attempts_at_best (NEWLY ADDED)
+ * LBTB: lifetime_total_boost_at_best
+ * LBTSB: lifetime_total_successful_boost_at_best
+ * LMB: lifetime_min_boost
+ */
 std::string SerializeStats(const PersistentData& data) {
     std::stringstream ss;
-    // Structure: PackID|ShotIndex|LBS|LBTB|LBTSB|LMB;PackID|ShotIndex|LBS|LBA|LMB;...
     for (const auto& pack_pair : data) {
         const std::string& pack_id = pack_pair.first;
         for (const auto& shot_pair : pack_pair.second) {
             ss << pack_id << "|"
                 << shot_pair.first << "|"
                 << shot_pair.second.lifetime_best_successes << "|"
+                << shot_pair.second.lifetime_attempts_at_best << "|" // <-- NEW: Persist the attempts count
                 << shot_pair.second.lifetime_total_boost_at_best << "|"
                 << shot_pair.second.lifetime_total_successful_boost_at_best << "|"
                 << shot_pair.second.lifetime_min_boost
@@ -47,12 +57,35 @@ PersistentData DeserializeStats(const std::string& str) {
             segments.push_back(segment);
         }
 
-        // Expecting 6 segments now (PackID, ShotIndex, LBS, LBTB, LBTSB, LMB)
-        if (segments.size() == 6) {
+        // --- NEW 7-segment format handling ---
+        // (PackID, ShotIndex, LBS, LBA, LBTB, LBTSB, LMB)
+        if (segments.size() == 7) {
             std::string pack_id = segments[0];
             int shot_index = std::stoi(segments[1]);
             ShotStats s;
             s.lifetime_best_successes = std::stoi(segments[2]);
+            s.lifetime_attempts_at_best = std::stoi(segments[3]); // <-- NEW: Read attempts count
+            s.lifetime_total_boost_at_best = std::stof(segments[4]);
+            s.lifetime_total_successful_boost_at_best = std::stof(segments[5]);
+            s.lifetime_min_boost = std::stof(segments[6]);
+
+            // Re-initialize session-specific parts safely
+            s.attempts = 0; s.successes = 0; s.total_boost_used = 0.0f;
+            s.total_successful_boost_used = 0.0f;
+            s.min_successful_boost_used = std::numeric_limits<float>::max();
+
+            data[pack_id][shot_index] = s;
+        }
+        // --- Legacy 6-segment format handling (Backward Compatibility) ---
+        // (PackID, ShotIndex, LBS, LBTB, LBTSB, LMB)
+        else if (segments.size() == 6) {
+            std::string pack_id = segments[0];
+            int shot_index = std::stoi(segments[1]);
+            ShotStats s;
+            s.lifetime_best_successes = std::stoi(segments[2]);
+            // NOTE: For legacy data, we must assume the default max attempts (10) 
+            // used when the data was saved, which is slightly imperfect but best practice for migration.
+            s.lifetime_attempts_at_best = 10;
             s.lifetime_total_boost_at_best = std::stof(segments[3]);
             s.lifetime_total_successful_boost_at_best = std::stof(segments[4]);
             s.lifetime_min_boost = std::stof(segments[5]);
@@ -62,8 +95,10 @@ PersistentData DeserializeStats(const std::string& str) {
             s.total_successful_boost_used = 0.0f;
             s.min_successful_boost_used = std::numeric_limits<float>::max();
 
-            // The lifetime attempts at best should match max_attempts_per_shot_ (10 by default)
-            s.lifetime_attempts_at_best = 10;
+            // Log that we encountered legacy data for debugging
+            if (_globalCvarManager) { // Added null check for robustness
+                _globalCvarManager->log("Deserialized legacy 6-segment data. Assuming lifetime_attempts_at_best = 10.");
+            }
 
             data[pack_id][shot_index] = s;
         }
@@ -105,7 +140,8 @@ void ConsistencyTrainer::onLoad()
         .addOnValueChanged([this](std::string, CVarWrapper cvar) { show_boost_stats_ = cvar.getBoolValue(); });
 
     // FIX: Hidden CVar for persistent string data
-    cvarManager->registerCvar("ct_persistent_data", "", "String storage for lifetime stats", true, true, 0.0f, true, 0.0f, true);
+    // Use the reliable signature: (name, default, description, searchable, saveToDisk)
+    cvarManager->registerCvar("ct_persistent_data", "", "String storage for lifetime stats", false, true);
 
 
     is_plugin_enabled_ = cvarManager->getCvar("ct_plugin_enabled").getBoolValue();
@@ -131,7 +167,9 @@ void ConsistencyTrainer::onLoad()
     gameWrapper->HookEventWithCallerPost<ActorWrapper>("Function TAGame.GameEvent_TrainingEditor_TA.OnResetShot",
         std::bind(&ConsistencyTrainer::OnShotReset, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 
-    // OnBallExploded hook removed to prevent race condition
+    // FIX: Re-adding OnBallExploded hook to catch failed attempts
+    gameWrapper->HookEvent("Function TAGame.GameEvent_TrainingEditor_TA.OnBallExploded",
+        [this](...) { OnBallExploded(nullptr); });
 
     gameWrapper->HookEventWithCallerPost<ActorWrapper>("Function TAGame.TrainingEditorNavigation_TA.SetCurrentActivePlaylistIndex",
         std::bind(&ConsistencyTrainer::OnPlaylistIndexChanged, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
@@ -141,7 +179,7 @@ void ConsistencyTrainer::onLoad()
 
     // Using the single-firing attempt event
     gameWrapper->HookEvent("Function TAGame.TrainingEditorMetrics_TA.TrainingShotAttempt",
-        [this](...) { OnShotAttempt(nullptr); });
+        [this](...) { OnShotAttempt(nullptr); }); // This hook is now used solely for boost reset and increment
 
     // Hook: Track boost usage every tick
     gameWrapper->HookEvent("Function TAGame.Car_TA.SetVehicleInput", [this](std::string eventName) { OnSetVehicleInput(eventName); });
@@ -168,16 +206,14 @@ void ConsistencyTrainer::onUnload() {
 
 // *** FIX: Uses TrainingEditorWrapper::GetTrainingFileName() for the unique ID ***
 std::string ConsistencyTrainer::GetCurrentPackID() {
-    if (!gameWrapper->IsInCustomTraining()) return "";
-
-    ServerWrapper server = gameWrapper->GetCurrentGameState();
-    if (server.IsNull()) return "";
-
-    TrainingEditorWrapper training_editor(server.memory_address);
-    if (training_editor.IsNull()) return "";
-
-    // Use GetTrainingFileName() as it is present in the wrapper definition provided.
-    return training_editor.GetTrainingFileName().ToString();
+    if (gameWrapper->IsInCustomTraining()) {
+        ServerWrapper server = gameWrapper->GetCurrentGameState();
+        if (server.IsNull()) return "";
+        TrainingEditorWrapper training_editor(server.memory_address);
+        if (training_editor.IsNull()) return "";
+        return training_editor.GetTrainingFileName().ToString();
+    }
+    return "";
 }
 
 // *** FIX: Logic to load persistent stats from CVar ***
@@ -204,7 +240,7 @@ void ConsistencyTrainer::LoadPersistentStats() {
 
 // *** FIX: Logic to save persistent stats to CVar ***
 void ConsistencyTrainer::SavePersistentStats() {
-    // Only save if there is an active pack's data to save
+    // Only save if there is data to serialize
     if (global_pack_stats_.empty()) return;
 
     try {
@@ -228,7 +264,6 @@ void ConsistencyTrainer::InitializeSessionStats()
     training_session_stats_.clear();
     current_shot_index_ = 0;
     current_attempt_boost_used_ = 0.0f; // Reset boost tracker
-    is_new_shot_loaded_ = true; // Mark as new shot
     current_pack_id_ = GetCurrentPackID(); // Set new pack ID
 
     if (gameWrapper->IsInCustomTraining())
@@ -253,6 +288,7 @@ void ConsistencyTrainer::InitializeSessionStats()
                 training_session_stats_[i] = ShotStats();
                 // Initialize min boost to max possible float value
                 training_session_stats_[i].min_successful_boost_used = std::numeric_limits<float>::max();
+                training_session_stats_[i].lifetime_min_boost = std::numeric_limits<float>::max();
             }
             else {
                 // For existing shots, reset session-specific stats
@@ -287,36 +323,72 @@ void ConsistencyTrainer::ResetSessionStats()
         pair.second.min_successful_boost_used = std::numeric_limits<float>::max();
     }
     current_attempt_boost_used_ = 0.0f;
-    is_new_shot_loaded_ = true;
     cvarManager->log("Session stats reset by user action (values zeroed).");
 }
 
-// Logic to check and update lifetime bests
+// NEW HELPER: Resets only the session-specific stats for a single shot
+void ConsistencyTrainer::ResetCurrentShotSessionStats(ShotStats& stats)
+{
+    stats.attempts = 0;
+    stats.successes = 0;
+    stats.total_boost_used = 0.0f;
+    stats.total_successful_boost_used = 0.0f;
+    stats.min_successful_boost_used = std::numeric_limits<float>::max();
+    current_attempt_boost_used_ = 0.0f; // Reset global accumulator too
+}
+
+/**
+ * @brief Updates the lifetime best stats based on the current session's performance.
+ * * New Logic: Updates best consistency ONLY if the current run used MORE OR EQUAL attempts
+ * than the existing lifetime best AND the ratio is maintained or improved.
+ */
 void ConsistencyTrainer::UpdateLifetimeBest(ShotStats& stats) {
-    // We only update lifetime bests when the current session's attempts equal the max.
-    if (stats.attempts == max_attempts_per_shot_) {
 
-        // 1. Update Consistency & Associated Boost Metrics
-        // Check if current success count is better than the lifetime best
-        if (stats.successes > stats.lifetime_best_successes) {
-            stats.lifetime_best_successes = stats.successes;
-            // Record the metrics associated with this new best consistency run
-            stats.lifetime_total_boost_at_best = stats.total_boost_used;
-            stats.lifetime_total_successful_boost_at_best = stats.total_successful_boost_used;
-            // The attempts are always max_attempts_per_shot_
-            stats.lifetime_attempts_at_best = max_attempts_per_shot_;
-
-            cvarManager->log("New Lifetime Best Consistency for Shot " + std::to_string(current_shot_index_ + 1) + ": " + std::to_string(stats.successes) + "/" + std::to_string(stats.lifetime_attempts_at_best));
-        }
-    }
-
-    // 2. Update Absolute Minimum Successful Boost (This is tracked independently)
-    // Check if the best min_successful_boost_used recorded in the current session (for THIS specific shot) is better than the lifetime best.
+    // 1. Update Absolute Minimum Successful Boost (This is tracked independently)
     if (stats.min_successful_boost_used != std::numeric_limits<float>::max() &&
         stats.min_successful_boost_used < stats.lifetime_min_boost)
     {
         stats.lifetime_min_boost = stats.min_successful_boost_used;
         cvarManager->log("New Lifetime Best Min Boost (Individual) for Shot " + std::to_string(current_shot_index_ + 1) + ": " + std::to_string(stats.lifetime_min_boost));
+    }
+
+    // 2. Update Consistency & Associated Boost Metrics
+    if (stats.attempts > 0) {
+        float current_ratio = (float)stats.successes / stats.attempts;
+
+        // Calculate lifetime best ratio (handle division by zero if lifetime attempts is 0)
+        float lifetime_ratio = (stats.lifetime_attempts_at_best > 0)
+            ? (float)stats.lifetime_best_successes / stats.lifetime_attempts_at_best
+            : -1.0f; // Use -1.0f to ensure any real ratio is initially better
+
+        // Condition 1: Must maintain or beat the ratio (using a small epsilon for float comparison)
+        bool meets_ratio_threshold = current_ratio > lifetime_ratio || (std::abs(current_ratio - lifetime_ratio) < 0.0001f);
+
+        // Condition 2: Must be a run that is LONGER OR EQUAL in length (User's new mandate: >=)
+        bool meets_attempt_threshold = stats.attempts >= stats.lifetime_attempts_at_best;
+
+        bool should_update = false;
+
+        // Case A: No previous data (always update)
+        if (stats.lifetime_attempts_at_best == 0) {
+            should_update = true;
+        }
+        // Case B: New record must be LONGER OR EQUAL AND maintain/improve ratio
+        else if (meets_attempt_threshold && meets_ratio_threshold) {
+            should_update = true;
+        }
+
+        if (should_update) {
+            // Update lifetime best metrics using current session's run data
+            stats.lifetime_best_successes = stats.successes;
+            stats.lifetime_attempts_at_best = stats.attempts;
+
+            // Recalculate and update associated boost metrics based on current run
+            stats.lifetime_total_boost_at_best = stats.total_boost_used;
+            stats.lifetime_total_successful_boost_at_best = stats.total_successful_boost_used;
+
+            cvarManager->log("New Lifetime Best Consistency (Sustained Run) for Shot " + std::to_string(current_shot_index_ + 1) + ": " + std::to_string(stats.successes) + "/" + std::to_string(stats.attempts));
+        }
     }
 }
 
@@ -327,16 +399,18 @@ bool ConsistencyTrainer::IsShotFrozen()
     if (training_session_stats_.find(current_shot_index_) == training_session_stats_.end()) return true;
 
     ShotStats& stats = training_session_stats_[current_shot_index_];
+    // This check is now only used internally by OnSetVehicleInput and OnShotAttempt to prevent counting/boosting 
+    // after the finalization logic in HandleAttempt has run.
     return stats.attempts >= max_attempts_per_shot_;
 }
 
 // FIXED: Per-tick boost tracking function using CarWrapper::GetInput()
 void ConsistencyTrainer::OnSetVehicleInput(std::string eventName)
 {
+    // The IsShotFrozen check here is necessary to stop boost logging once the max attempts are processed.
     if (!is_plugin_enabled_ || !gameWrapper->IsInCustomTraining() || IsShotFrozen()) return;
 
-    // Check if the current shot has started (to accumulate boost)
-    if (is_new_shot_loaded_ || training_session_stats_.empty()) return;
+    if (training_session_stats_.empty()) return;
 
     CarWrapper car = gameWrapper->GetLocalCar();
     if (car.IsNull()) return;
@@ -355,36 +429,50 @@ void ConsistencyTrainer::OnSetVehicleInput(std::string eventName)
 
 
 // --- Event Handlers ---
+
+// FIX: OnShotAttempt now increments the attempt counter for EVERY new shot, resolving visual lag.
 void ConsistencyTrainer::OnShotAttempt(void* params)
 {
-    if (!is_plugin_enabled_ || !IsInValidTraining() || IsShotFrozen()) return;
+    if (!is_plugin_enabled_ || !IsInValidTraining()) return;
 
-    // The is_new_shot_loaded_ flag ensures we only do this once after the shot starts.
-    if (is_new_shot_loaded_)
-    {
-        if (training_session_stats_.find(current_shot_index_) != training_session_stats_.end())
-        {
-            ShotStats& stats = training_session_stats_[current_shot_index_];
-            if (stats.attempts < max_attempts_per_shot_) {
-                stats.attempts++;
-                cvarManager->log("Attempt " + std::to_string(stats.attempts) + " started for shot " + std::to_string(current_shot_index_ + 1));
-            }
-        }
-        is_new_shot_loaded_ = false;
+    // Ensure we have stats for the current shot
+    if (training_session_stats_.find(current_shot_index_) == training_session_stats_.end()) {
+        training_session_stats_[current_shot_index_] = ShotStats();
     }
+    ShotStats& stats = training_session_stats_.at(current_shot_index_);
+
+    // CRITICAL FIX: Robust counter logic
+    if (stats.attempts < max_attempts_per_shot_) {
+        // Normal increment for attempts 1 through N
+        stats.attempts++;
+        cvarManager->log("Shot attempt " + std::to_string(stats.attempts) + " started (Immediate Increment). Boost counter reset to 0.0.");
+    }
+    else if (stats.attempts >= max_attempts_per_shot_) {
+        // If we are here, it means the outcome for the final attempt (N) was processed in HandleAttempt, 
+        // which called ResetCurrentShotSessionStats (setting attempts to 0), but the current event 
+        // fired before the 0 was registered, or the counter was stuck. 
+        // We force the reset state to 1 to cleanly start the next run.
+        ResetCurrentShotSessionStats(stats); // Sets attempts to 0
+        stats.attempts = 1; // Starts new run at 1
+        cvarManager->log("Max attempts exceeded/Stuck counter. Forced Reset. Starting Attempt 1 of new run.");
+    }
+
+    // Reset boost accumulator for the new shot attempt
+    current_attempt_boost_used_ = 0.0f;
 }
 
-// FIX: Changed function definition to match simplified header declaration
+// FIX: Removed IsShotFrozen() check here to allow the final attempt's outcome to be processed.
 void ConsistencyTrainer::OnGoalScored(void* params)
 {
-    if (!is_plugin_enabled_ || !IsInValidTraining() || IsShotFrozen()) return;
+    if (!is_plugin_enabled_ || !IsInValidTraining()) return;
 
-    // Use a small timeout for success to let the game fully process the goal and prevent the reset handler from firing immediately.
+    // Use a small timeout for success to let the game fully process the goal.
     gameWrapper->SetTimeout([this](...) {
         HandleAttempt(true);
-    }, 0.01f);
+    }, 0.05f);
 }
 
+// FIX: Removed IsShotFrozen() check here to allow the final attempt's outcome to be processed.
 void ConsistencyTrainer::OnShotReset(ActorWrapper caller, void* params, std::string eventName)
 {
     if (!is_plugin_enabled_ || !IsInValidTraining()) return;
@@ -394,17 +482,21 @@ void ConsistencyTrainer::OnShotReset(ActorWrapper caller, void* params, std::str
         return;
     }
 
-    if (IsShotFrozen()) return;
-
-    // Use a small timeout for failure too, to ensure we don't interfere with the delayed success logic.
+    // If the reset wasn't plugin-initiated, it was a manual user reset (which counts as a failure).
     gameWrapper->SetTimeout([this](...) {
         HandleAttempt(false);
-    }, 0.01f);
+    }, 0.05f);
 }
 
+// FIX: Removed IsShotFrozen() check here to allow the final attempt's outcome to be processed.
 void ConsistencyTrainer::OnBallExploded(void* params)
 {
-    // Do nothing. Reliance is now on OnGoalScored and OnShotReset.
+    if (!is_plugin_enabled_ || !IsInValidTraining()) return;
+
+    // Treat the explosion as an immediate failure and reset the shot.
+    gameWrapper->SetTimeout([this](...) {
+        HandleAttempt(false);
+    }, 0.05f);
 }
 
 // *** MODIFIED: OnPlaylistIndexChanged now handles saving/updating lifetime bests on shot change ***
@@ -415,7 +507,9 @@ void ConsistencyTrainer::OnPlaylistIndexChanged(ActorWrapper caller, void* param
     PlaylistIndexParams* p = static_cast<PlaylistIndexParams*>(params);
 
     // If the index changed AND we were in a valid session, update the lifetime bests for the old shot.
+    // This ensures min-boost and any achieved consistency ratio are saved before moving on.
     if (current_shot_index_ != p->Index && !training_session_stats_.empty()) {
+        // FIX: Update lifetime best *ratio* and min boost when leaving a shot
         UpdateLifetimeBest(training_session_stats_[current_shot_index_]);
         // Also save the current session data immediately when the player moves to a different shot
         SavePersistentStats();
@@ -427,70 +521,74 @@ void ConsistencyTrainer::OnPlaylistIndexChanged(ActorWrapper caller, void* param
     }
     // Reset boost tracker for the new shot
     current_attempt_boost_used_ = 0.0f;
-    is_new_shot_loaded_ = true;
 }
 
 
 // --- Core Logic ---
 bool ConsistencyTrainer::IsInValidTraining() { return gameWrapper->IsInCustomTraining(); }
 
-// MODIFIED: HandleAttempt now saves boost data
+// MODIFIED: HandleAttempt is now the single source of truth for recording outcome and shot reset/freeze logic.
 void ConsistencyTrainer::HandleAttempt(bool isSuccess)
 {
     // Ensure we have stats for the current shot
     if (training_session_stats_.find(current_shot_index_) == training_session_stats_.end()) {
-        training_session_stats_[current_shot_index_] = ShotStats();
+        // If HandleAttempt is called but no stats exist, it likely means no attempt event fired yet.
+        return;
     }
 
     ShotStats& stats = training_session_stats_[current_shot_index_];
 
-    // We only proceed if an attempt was recorded (stats.attempts > 0)
-    if (stats.attempts > 0 && stats.attempts <= max_attempts_per_shot_) {
-
-        // 1. RECORD SUCCESS/FAILURE STATUS & BOOST USAGE FIRST
-        stats.total_boost_used += current_attempt_boost_used_;
-
-        if (isSuccess) {
-            stats.successes++;
-            stats.total_successful_boost_used += current_attempt_boost_used_;
-            // Check and update minimum boost used on a successful shot
-            if (current_attempt_boost_used_ < stats.min_successful_boost_used) {
-                stats.min_successful_boost_used = current_attempt_boost_used_;
-            }
-            cvarManager->log("SUCCESS recorded. Boost Used: " + std::to_string(current_attempt_boost_used_));
-        }
-        else {
-            cvarManager->log("FAILURE recorded for attempt " + std::to_string(stats.attempts) + ". Boost Used: " + std::to_string(current_attempt_boost_used_));
-        }
-
-        // Reset boost tracker for the next attempt (even if it's a repeat of the same shot)
-        current_attempt_boost_used_ = 0.0f;
-        is_new_shot_loaded_ = true; // Set to true so OnShotAttempt can fire again
-
-        // 2. CHECK ATTEMPT COUNT AND DECIDE NEXT ACTION
-        if (stats.attempts < max_attempts_per_shot_) {
-            gameWrapper->SetTimeout([this](...) { RepeatCurrentShot(); }, 0.05f);
-        }
-        else {
-            // *** FIX: Update lifetime best on final attempt BEFORE ADVANCING ***
-            UpdateLifetimeBest(stats);
-            // *** FIX: AUTOMATICALLY SAVE STATS ON SHOT COMPLETION ***
-            SavePersistentStats();
-
-            // Max attempts reached, advance to the next shot
-            gameWrapper->SetTimeout([this](...) { AdvanceToNextShot(); }, 0.05f);
-        }
+    // Check if the current attempt number is 0. This means HandleAttempt fired but OnShotAttempt hasn't set the counter to 1 yet.
+    if (stats.attempts == 0) {
+        cvarManager->log("Skipping HandleAttempt: Attempt count is 0 (Race condition/Reset overlap).");
+        return;
     }
-    else if (stats.attempts > max_attempts_per_shot_) {
-        // If attempts count somehow surpassed max, ensure we advance to the next shot
-        gameWrapper->SetTimeout([this](...) { AdvanceToNextShot(); }, 0.05f);
-    }
-    // If stats.attempts is 0 (i.e. the array was cleared and HandleAttempt was called without OnShotAttempt), do nothing.
-}
 
-void ConsistencyTrainer::AdvanceToNextShot() {
-    plugin_initiated_reset_ = true;
-    cvarManager->executeCommand("training_next");
+    // CRITICAL FIX: Determine if this is the final attempt TO BE PROCESSED.
+    bool is_final_attempt = stats.attempts == max_attempts_per_shot_;
+
+    // 1. RECORD SUCCESS/FAILURE STATUS & BOOST USAGE FIRST
+    stats.total_boost_used += current_attempt_boost_used_;
+
+    if (isSuccess) {
+        stats.successes++;
+        stats.total_successful_boost_used += current_attempt_boost_used_;
+        // Check and update minimum boost used on a successful shot
+        if (current_attempt_boost_used_ < stats.min_successful_boost_used) {
+            stats.min_successful_boost_used = current_attempt_boost_used_;
+        }
+        cvarManager->log("SUCCESS recorded. Attempt " + std::to_string(stats.attempts) + ". Boost Used: " + std::to_string(current_attempt_boost_used_));
+    }
+    else {
+        cvarManager->log("FAILURE recorded. Attempt " + std::to_string(stats.attempts) + ". Boost Used: " + std::to_string(current_attempt_boost_used_));
+    }
+
+    // Reset boost tracker (OnShotAttempt will also do this, but this is safer)
+    current_attempt_boost_used_ = 0.0f;
+
+    // *** CRITICAL: Update lifetime best and save after EVERY attempt ***
+    UpdateLifetimeBest(stats);
+    SavePersistentStats();
+
+    // 2. CHECK ATTEMPT COUNT AND DECIDE NEXT ACTION
+    if (!is_final_attempt) {
+        // If not the final attempt, schedule the shot reset to begin the next attempt.
+        // The attempt counter for the next shot is handled by OnShotAttempt when the shot loads.
+        gameWrapper->SetTimeout([this](...) {
+            this->RepeatCurrentShot();
+        }, 0.10f);
+    }
+    else {
+        // Max attempts reached (e.g., attempts is 10). Auto-reset session stats and repeat shot.
+
+        // Reset the current session stats (attempts, successes, total boost) to zero.
+        // This ensures OnShotAttempt increments the counter back to 1 for the next run.
+        ResetCurrentShotSessionStats(stats);
+
+        // Then repeat the shot immediately to start the new session run
+        cvarManager->log("Shot " + std::to_string(current_shot_index_ + 1) + " completed max attempts. Session stats reset and shot repeated (new run started).");
+        gameWrapper->SetTimeout([this](...) { RepeatCurrentShot(); }, 0.10f);
+    }
 }
 
 void ConsistencyTrainer::RepeatCurrentShot()
@@ -540,7 +638,7 @@ void ConsistencyTrainer::RenderSettings()
         ImGui::Columns(7, "session_stats_table", true); // EXPANDED COLUMNS
         ImGui::Text("Shot #"); ImGui::NextColumn();
         ImGui::Text("Success/Best"); ImGui::NextColumn();
-        ImGui::Text("Attempts"); ImGui::NextColumn();
+        ImGui::Text("Attempts/Best"); ImGui::NextColumn(); // MODIFIED HEADER
         ImGui::Text("Consistency"); ImGui::NextColumn();
         ImGui::Text("Avg Boost (All)"); ImGui::NextColumn();
         ImGui::Text("Avg Boost (Success/Best)"); ImGui::NextColumn(); // Combined display
@@ -549,6 +647,8 @@ void ConsistencyTrainer::RenderSettings()
         for (const auto& pair : training_session_stats_)
         {
             float consistency = (pair.second.attempts > 0) ? (static_cast<float>(pair.second.successes) / pair.second.attempts * 100.0f) : 0.0f;
+            float best_consistency = (pair.second.lifetime_attempts_at_best > 0) ? (static_cast<float>(pair.second.lifetime_best_successes) / pair.second.lifetime_attempts_at_best * 100.0f) : 0.0f;
+
             float avg_boost = (pair.second.attempts > 0) ? (pair.second.total_boost_used / pair.second.attempts) : 0.0f;
             float avg_success_boost = (pair.second.successes > 0) ? (pair.second.total_successful_boost_used / pair.second.successes) : 0.0f;
             float avg_success_boost_best_consist = (pair.second.lifetime_attempts_at_best > 0 && pair.second.lifetime_best_successes > 0) ? (pair.second.lifetime_total_successful_boost_at_best / pair.second.lifetime_best_successes) : 0.0f;
@@ -557,10 +657,12 @@ void ConsistencyTrainer::RenderSettings()
             float min_success_boost_life = (pair.second.lifetime_min_boost != std::numeric_limits<float>::max()) ? pair.second.lifetime_min_boost : 0.0f;
 
             ImGui::Text("%d", pair.first + 1); ImGui::NextColumn();
-            // Display Current/Lifetime Best Consistency
+            // Display Current/Lifetime Best Successes
             ImGui::Text("%d/%d", pair.second.successes, pair.second.lifetime_best_successes); ImGui::NextColumn();
-            ImGui::Text("%d", pair.second.attempts); ImGui::NextColumn();
-            ImGui::Text("%.1f%%", consistency); ImGui::NextColumn();
+            // Display Current/Lifetime Best Attempts
+            ImGui::Text("%d/%d", pair.second.attempts, pair.second.lifetime_attempts_at_best); ImGui::NextColumn(); // MODIFIED ROW
+            // Display Current Consistency / Lifetime Best Consistency
+            ImGui::Text("%.1f%%/%.1f%%", consistency, best_consistency); ImGui::NextColumn(); // MODIFIED ROW
             ImGui::Text("%.1f", avg_boost); ImGui::NextColumn();
             ImGui::Text("%.1f/%.1f", avg_success_boost, avg_success_boost_best_consist); ImGui::NextColumn();
             ImGui::Text("%.1f/%.1f", min_success_boost_curr, min_success_boost_life); ImGui::NextColumn();
@@ -588,6 +690,8 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
 
     // Calculate values
     float consistency = (current_stats.attempts > 0) ? (static_cast<float>(current_stats.successes) / current_stats.attempts * 100.0f) : 0.0f;
+    float best_consistency = (current_stats.lifetime_attempts_at_best > 0) ? (static_cast<float>(current_stats.lifetime_best_successes) / current_stats.lifetime_attempts_at_best * 100.0f) : 0.0f;
+
     float avg_boost = (current_stats.attempts > 0) ? (current_stats.total_boost_used / current_stats.attempts) : 0.0f;
     float avg_success_boost = (current_stats.successes > 0) ? (current_stats.total_successful_boost_used / current_stats.successes) : 0.0f;
     float avg_success_boost_best_consist = (current_stats.lifetime_attempts_at_best > 0 && current_stats.lifetime_best_successes > 0) ? (current_stats.lifetime_total_successful_boost_at_best / current_stats.lifetime_best_successes) : 0.0f;
@@ -610,8 +714,8 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
         canvas.DrawString(buffer, text_scale_, text_scale_);
         current_y += line_height;
 
-        // Line 2: Attempts
-        snprintf(buffer, sizeof(buffer), "Attempts: %d/%d", current_stats.attempts, max_attempts_per_shot_);
+        // Line 2: Attempts (Current vs. Max/Best)
+        snprintf(buffer, sizeof(buffer), "Attempts: %d/%d (Best: %d)", current_stats.attempts, max_attempts_per_shot_, current_stats.lifetime_attempts_at_best);
         canvas.SetPosition(Vector2{ text_pos_x_, current_y });
         canvas.DrawString(buffer, text_scale_, text_scale_);
         current_y += line_height;
@@ -622,8 +726,8 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
         canvas.DrawString(buffer, text_scale_, text_scale_);
         current_y += line_height;
 
-        // Line 4: Consistency
-        snprintf(buffer, sizeof(buffer), "Consistency: %.1f%%", consistency);
+        // Line 4: Consistency (Current vs. Lifetime Best)
+        snprintf(buffer, sizeof(buffer), "Consistency: %.1f%% (Best: %.1f%%)", consistency, best_consistency);
         canvas.SetPosition(Vector2{ text_pos_x_, current_y });
         canvas.DrawString(buffer, text_scale_, text_scale_);
         current_y += line_height * 0.75f; // Add a small gap after the group
@@ -658,7 +762,7 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
         canvas.DrawString(buffer, text_scale_, text_scale_);
         current_y += line_height;
 
-        // Line 9: Current Boost
+        // Line 9: Current Boost (This will now track accurately from OnShotAttempt reset)
         snprintf(buffer, sizeof(buffer), "Boost Current: %.1f", current_attempt_boost_used_);
         canvas.SetPosition(Vector2{ text_pos_x_, current_y });
         canvas.DrawString(buffer, text_scale_, text_scale_);
