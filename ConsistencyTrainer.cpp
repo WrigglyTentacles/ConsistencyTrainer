@@ -2,9 +2,9 @@
 #include "ConsistencyTrainer.h"
 #include "imgui/imgui.h"
 #include <limits>
-#include <sstream> 
+#include <sstream> 
 #include <algorithm>
-#include <iostream> 
+#include <iostream> 
 
 // Helper functions for basic serialization (using a simple, parsable format)
 
@@ -83,7 +83,7 @@ PersistentData DeserializeStats(const std::string& str) {
             int shot_index = std::stoi(segments[1]);
             ShotStats s;
             s.lifetime_best_successes = std::stoi(segments[2]);
-            // NOTE: For legacy data, we must assume the default max attempts (10) 
+            // NOTE: For legacy data, we must assume the default max attempts (10) 
             // used when the data was saved, which is slightly imperfect but best practice for migration.
             s.lifetime_attempts_at_best = 10;
             s.lifetime_total_boost_at_best = std::stof(segments[3]);
@@ -216,6 +216,18 @@ std::string ConsistencyTrainer::GetCurrentPackID() {
     return "";
 }
 
+// *** NEW HELPER: Get the total number of rounds in the current pack ***
+int ConsistencyTrainer::GetTotalRounds() {
+    if (gameWrapper->IsInCustomTraining()) {
+        ServerWrapper server = gameWrapper->GetCurrentGameState();
+        if (server.IsNull()) return 0;
+        TrainingEditorWrapper training_editor(server.memory_address);
+        if (training_editor.IsNull()) return 0;
+        return training_editor.GetTotalRounds();
+    }
+    return 0;
+}
+
 // *** FIX: Logic to load persistent stats from CVar ***
 void ConsistencyTrainer::LoadPersistentStats() {
     CVarWrapper cvar = cvarManager->getCvar("ct_persistent_data");
@@ -253,7 +265,7 @@ void ConsistencyTrainer::SavePersistentStats() {
     }
 }
 
-// Safely initializes the session map ONLY when training starts 
+// Safely initializes the session map ONLY when training starts 
 void ConsistencyTrainer::InitializeSessionStats()
 {
     // FIX: Save existing pack stats before initializing the new pack
@@ -312,7 +324,7 @@ void ConsistencyTrainer::InitializeSessionStats()
 // FIX: Iterate and zero out values instead of clearing the map
 void ConsistencyTrainer::ResetSessionStats()
 {
-    // Iterate over the existing map and zero out the current session counts. 
+    // Iterate over the existing map and zero out the current session counts. 
     for (auto& pair : training_session_stats_) {
         // Only reset session-specific values, preserve lifetime data
         pair.second.attempts = 0;
@@ -399,7 +411,7 @@ bool ConsistencyTrainer::IsShotFrozen()
     if (training_session_stats_.find(current_shot_index_) == training_session_stats_.end()) return true;
 
     ShotStats& stats = training_session_stats_[current_shot_index_];
-    // This check is now only used internally by OnSetVehicleInput and OnShotAttempt to prevent counting/boosting 
+    // This check is now only used internally by OnSetVehicleInput and OnShotAttempt to prevent counting/boosting 
     // after the finalization logic in HandleAttempt has run.
     return stats.attempts >= max_attempts_per_shot_;
 }
@@ -448,9 +460,9 @@ void ConsistencyTrainer::OnShotAttempt(void* params)
         cvarManager->log("Shot attempt " + std::to_string(stats.attempts) + " started (Immediate Increment). Boost counter reset to 0.0.");
     }
     else if (stats.attempts >= max_attempts_per_shot_) {
-        // If we are here, it means the outcome for the final attempt (N) was processed in HandleAttempt, 
-        // which called ResetCurrentShotSessionStats (setting attempts to 0), but the current event 
-        // fired before the 0 was registered, or the counter was stuck. 
+        // If we are here, it means the outcome for the final attempt (N) was processed in HandleAttempt, 
+        // which called ResetCurrentShotSessionStats (setting attempts to 0), but the current event 
+        // fired before the 0 was registered, or the counter was stuck. 
         // We force the reset state to 1 to cleanly start the next run.
         ResetCurrentShotSessionStats(stats); // Sets attempts to 0
         stats.attempts = 1; // Starts new run at 1
@@ -499,24 +511,40 @@ void ConsistencyTrainer::OnBallExploded(void* params)
     }, 0.05f);
 }
 
-// *** MODIFIED: OnPlaylistIndexChanged now handles saving/updating lifetime bests on shot change ***
+// *** CRITICAL FIX: Modified OnPlaylistIndexChanged to correct both positive and negative looping shot index ***
 void ConsistencyTrainer::OnPlaylistIndexChanged(ActorWrapper caller, void* params, std::string eventName)
 {
     if (!is_plugin_enabled_ || params == nullptr) return;
 
     PlaylistIndexParams* p = static_cast<PlaylistIndexParams*>(params);
+    int new_index = p->Index;
+
+    // Get the total number of shots in the pack
+    int total_shots = GetTotalRounds();
+
+    // 1. Correct the positive loop-back (e.g., 49 -> 50, but should be 0)
+    if (total_shots > 0 && new_index >= total_shots) {
+        new_index = 0;
+        cvarManager->log("Playlist index looped FORWARD. Corrected index from " + std::to_string(p->Index) + " to " + std::to_string(new_index));
+    }
+    // 2. Correct the negative loop-back (e.g., 0 -> -1, but should be 49)
+    else if (total_shots > 0 && new_index < 0) {
+        new_index = total_shots - 1;
+        cvarManager->log("Playlist index looped BACKWARD. Corrected index from " + std::to_string(p->Index) + " to " + std::to_string(new_index));
+    }
+
 
     // If the index changed AND we were in a valid session, update the lifetime bests for the old shot.
     // This ensures min-boost and any achieved consistency ratio are saved before moving on.
-    if (current_shot_index_ != p->Index && !training_session_stats_.empty()) {
+    if (current_shot_index_ != new_index && !training_session_stats_.empty()) {
         // FIX: Update lifetime best *ratio* and min boost when leaving a shot
         UpdateLifetimeBest(training_session_stats_[current_shot_index_]);
         // Also save the current session data immediately when the player moves to a different shot
         SavePersistentStats();
     }
 
-    if (current_shot_index_ != p->Index) {
-        current_shot_index_ = p->Index;
+    if (current_shot_index_ != new_index) {
+        current_shot_index_ = new_index;
         cvarManager->log("Playlist index changed to: " + std::to_string(current_shot_index_));
     }
     // Reset boost tracker for the new shot

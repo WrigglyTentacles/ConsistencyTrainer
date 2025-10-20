@@ -8,7 +8,7 @@
 
 // Corrected wrapper paths for necessary classes
 #include "bakkesmod/wrappers/GameObject/CarWrapper.h"
-#include "bakkesmod/wrappers/PlayerControllerWrapper.h" 
+#include "bakkesmod/wrappers/PlayerControllerWrapper.h"
 
 #include <string>
 #include <map>
@@ -60,6 +60,8 @@ private:
     void SavePersistentStats();
     void UpdateLifetimeBest(ShotStats& current_stats);
     std::string GetCurrentPackID();
+    // *** NEW: Helper to get the total number of shots for index correction ***
+    int GetTotalRounds();
 
     // Game event hooks
     void OnGoalScored(void* params);
