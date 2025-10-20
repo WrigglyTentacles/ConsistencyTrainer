@@ -1,6 +1,6 @@
 🎯 Consistency Trainer - BakkesMod Plugin
 
-A highly detailed Custom Training plugin for Rocket League designed to help players accurately measure and improve sustained consistency and boost efficiency over long practice sessions.
+This plugin is a consistency training tracker designed to help you accurately measure and improve your performance across various custom shot packs. It focuses on sustained consistency and boost efficiency over long practice sessions.
 
 ✨ Features
 
@@ -33,6 +33,12 @@ Flow Control
 Max Attempts Auto-Reset: When the Max Attempts Per Shot limit is reached, the plugin automatically saves the lifetime data, resets the session stats (attempts go back to 0), and repeats the current shot, allowing for continuous cycles of consistency training without manual resets.
 
 Robust Event Handling: Uses event handlers for Goal Scored, Shot Reset (user or plugin initiated), and Ball Exploded to guarantee every outcome is correctly recorded as a success or failure.
+
+⚠️ Known Issues
+
+While the plugin is designed to save your lifetime statistics, there is a current, known bug where persistent data is not reliably loading across Rocket League reboots or plugin unload/load cycles.
+
+Your consistency session data will be tracked and saved while the game is running, but it may be lost upon restarting Rocket League. This issue is actively being investigated.
 
 ⚙️ Installation
 
@@ -109,32 +115,12 @@ Schedules RepeatCurrentShot to start the new cycle. (The next OnShotAttempt then
 
 CVar Settings (Quick Reference)
 
-CVar
+Use the BakkesMod console (F6) to modify these settings:
 
-Default
+ct_plugin_enabled (Default: 0): Enable/Disable the core plugin logic.
 
-Description
+ct_max_attempts (Default: 10): Sets the length of a single consistency run before auto-reset.
 
-ct_plugin_enabled
+ct_window_open (Default: 0): Toggles the in-game display overlay.
 
-0
-
-Enable/Disable the core plugin logic.
-
-ct_max_attempts
-
-10
-
-Sets the length of a single consistency run before auto-reset.
-
-ct_window_open
-
-0
-
-Toggles the in-game display overlay.
-
-ct_text_x / ct_text_y
-
-100 / 200
-
-Position of the in-game display.
+ct_text_x / ct_text_y (Default: 100 / 200): Position of the in-game display.
