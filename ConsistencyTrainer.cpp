@@ -2,9 +2,10 @@
 #include "ConsistencyTrainer.h"
 #include "imgui/imgui.h"
 #include <limits>
-#include <sstream> 
+#include <sstream>
 #include <algorithm>
-#include <iostream> 
+#include <iostream>
+#include <fstream> 
 
 // Helper functions for basic serialization (using a simple, parsable format)
 
@@ -25,7 +26,7 @@ std::string SerializeStats(const PersistentData& data) {
             ss << pack_id << "|"
                 << shot_pair.first << "|"
                 << shot_pair.second.lifetime_best_successes << "|"
-                << shot_pair.second.lifetime_attempts_at_best << "|" // <-- NEW: Persist the attempts count
+                << shot_pair.second.lifetime_attempts_at_best << "|" // <-- Persist the attempts count
                 << shot_pair.second.lifetime_total_boost_at_best << "|"
                 << shot_pair.second.lifetime_total_successful_boost_at_best << "|"
                 << shot_pair.second.lifetime_min_boost
@@ -64,7 +65,7 @@ PersistentData DeserializeStats(const std::string& str) {
             int shot_index = std::stoi(segments[1]);
             ShotStats s;
             s.lifetime_best_successes = std::stoi(segments[2]);
-            s.lifetime_attempts_at_best = std::stoi(segments[3]); // <-- NEW: Read attempts count
+            s.lifetime_attempts_at_best = std::stoi(segments[3]); // <-- Read attempts count
             s.lifetime_total_boost_at_best = std::stof(segments[4]);
             s.lifetime_total_successful_boost_at_best = std::stof(segments[5]);
             s.lifetime_min_boost = std::stof(segments[6]);
@@ -83,8 +84,7 @@ PersistentData DeserializeStats(const std::string& str) {
             int shot_index = std::stoi(segments[1]);
             ShotStats s;
             s.lifetime_best_successes = std::stoi(segments[2]);
-            // NOTE: For legacy data, we must assume the default max attempts (10) 
-            // used when the data was saved, which is slightly imperfect but best practice for migration.
+            // NOTE: For legacy data, we must assume the default max attempts (10)
             s.lifetime_attempts_at_best = 10;
             s.lifetime_total_boost_at_best = std::stof(segments[3]);
             s.lifetime_total_successful_boost_at_best = std::stof(segments[4]);
@@ -96,7 +96,7 @@ PersistentData DeserializeStats(const std::string& str) {
             s.min_successful_boost_used = std::numeric_limits<float>::max();
 
             // Log that we encountered legacy data for debugging
-            if (_globalCvarManager) { // Added null check for robustness
+            if (_globalCvarManager) {
                 _globalCvarManager->log("Deserialized legacy 6-segment data. Assuming lifetime_attempts_at_best = 10.");
             }
 
@@ -119,6 +119,12 @@ void ConsistencyTrainer::onLoad()
 {
     _globalCvarManager = cvarManager;
 
+    // ?? CRITICAL FILE PATH FIX: Use .string() or concatenation to correctly build the absolute path.
+    // This avoids the "no member toString" error and uses the BakkesMod path to ensure we can write the file.
+    dataFilePath_ = gameWrapper->GetBakkesModPath().string() + "\\data\\ConsistencyTrainer.data";
+    cvarManager->log("Persistence file path set to: " + dataFilePath_);
+
+    // Register all standard CVars (unrelated to persistence string storage)
     cvarManager->registerCvar("ct_plugin_enabled", "0", "Enable/Disable the Consistency Trainer plugin")
         .addOnValueChanged([this](std::string, CVarWrapper cvar) { is_plugin_enabled_ = cvar.getBoolValue(); });
     cvarManager->registerCvar("ct_max_attempts", "10", "Max attempts per shot for consistency tracking")
@@ -129,64 +135,48 @@ void ConsistencyTrainer::onLoad()
         .addOnValueChanged([this](std::string, CVarWrapper cvar) { text_pos_y_ = cvar.getIntValue(); });
     cvarManager->registerCvar("ct_text_scale", "2.0", "Scale of the stats text")
         .addOnValueChanged([this](std::string, CVarWrapper cvar) { text_scale_ = cvar.getFloatValue(); });
-    // Register CVar for Stats Window visibility
     cvarManager->registerCvar("ct_window_open", "0", "Show/Hide the in-game stats window")
         .addOnValueChanged([this](std::string, CVarWrapper cvar) { is_window_open_ = cvar.getBoolValue(); });
-
-    // NEW: CVars for toggling stat groups
     cvarManager->registerCvar("ct_show_consistency", "1", "Show core consistency stats (attempts/successes)")
         .addOnValueChanged([this](std::string, CVarWrapper cvar) { show_consistency_stats_ = cvar.getBoolValue(); });
     cvarManager->registerCvar("ct_show_boost", "0", "Show boost usage stats")
         .addOnValueChanged([this](std::string, CVarWrapper cvar) { show_boost_stats_ = cvar.getBoolValue(); });
 
-    // FIX: Hidden CVar for persistent string data
-    // Use the reliable signature: (name, default, description, searchable, saveToDisk)
-    cvarManager->registerCvar("ct_persistent_data", "", "String storage for lifetime stats", false, true);
-
-
+    // Load all current CVar settings
     is_plugin_enabled_ = cvarManager->getCvar("ct_plugin_enabled").getBoolValue();
     max_attempts_per_shot_ = cvarManager->getCvar("ct_max_attempts").getIntValue();
     text_pos_x_ = cvarManager->getCvar("ct_text_x").getIntValue();
     text_pos_y_ = cvarManager->getCvar("ct_text_y").getIntValue();
     text_scale_ = cvarManager->getCvar("ct_text_scale").getFloatValue();
-    // Load state for Stats Window
     is_window_open_ = cvarManager->getCvar("ct_window_open").getBoolValue();
-    // Load state for stat toggles
     show_consistency_stats_ = cvarManager->getCvar("ct_show_consistency").getBoolValue();
     show_boost_stats_ = cvarManager->getCvar("ct_show_boost").getBoolValue();
 
-    // FIX: Load persistent stats on plugin load
+    // **Load persistent stats immediately from the dedicated file path.**
     LoadPersistentStats();
 
-
     // Event hooks
-    // Hook updated to match the simplified handler signature
     gameWrapper->HookEvent("Function TAGame.GameMetrics_TA.GoalScored",
-        [this](...) { OnGoalScored(nullptr); }); // Only passing params
+        [this](...) { OnGoalScored(nullptr); });
 
     gameWrapper->HookEventWithCallerPost<ActorWrapper>("Function TAGame.GameEvent_TrainingEditor_TA.OnResetShot",
         std::bind(&ConsistencyTrainer::OnShotReset, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 
-    // FIX: Re-adding OnBallExploded hook to catch failed attempts
     gameWrapper->HookEvent("Function TAGame.GameEvent_TrainingEditor_TA.OnBallExploded",
         [this](...) { OnBallExploded(nullptr); });
 
     gameWrapper->HookEventWithCallerPost<ActorWrapper>("Function TAGame.TrainingEditorNavigation_TA.SetCurrentActivePlaylistIndex",
         std::bind(&ConsistencyTrainer::OnPlaylistIndexChanged, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 
-    // Calls the robust initializer on training start
     gameWrapper->HookEvent("Function TAGame.GameEvent_TrainingEditor_TA.StartPlayTest", [this](...) { InitializeSessionStats(); });
 
-    // Using the single-firing attempt event
     gameWrapper->HookEvent("Function TAGame.TrainingEditorMetrics_TA.TrainingShotAttempt",
-        [this](...) { OnShotAttempt(nullptr); }); // This hook is now used solely for boost reset and increment
+        [this](...) { OnShotAttempt(nullptr); });
 
-    // Hook: Track boost usage every tick
     gameWrapper->HookEvent("Function TAGame.Car_TA.SetVehicleInput", [this](std::string eventName) { OnSetVehicleInput(eventName); });
 
 
     gameWrapper->RegisterDrawable(std::bind(&ConsistencyTrainer::RenderWindow, this, std::placeholders::_1));
-    // Notifier now toggles the CVar for the settings window
     cvarManager->registerNotifier("toggle_consistency_trainer", [this](...) {
         cvarManager->getCvar("ct_window_open").setValue(!is_window_open_);
     }, "Toggle the Consistency Trainer window", PERMISSION_ALL);
@@ -197,10 +187,10 @@ void ConsistencyTrainer::onUnload() {
     if (!training_session_stats_.empty() && !current_pack_id_.empty()) {
         global_pack_stats_[current_pack_id_] = training_session_stats_;
     }
+    // CRITICAL: Call SavePersistentStats to write data to disk when the plugin unloads.
     SavePersistentStats();
 
     gameWrapper->UnregisterDrawables();
-    // We should unhook the constant SetVehicleInput to free resources
     gameWrapper->UnhookEvent("Function TAGame.Car_TA.SetVehicleInput");
 }
 
@@ -228,50 +218,79 @@ int ConsistencyTrainer::GetTotalRounds() {
     return 0;
 }
 
-// *** FIX: Logic to load persistent stats from CVar ***
+// ?? CRITICAL FIX: Logic to load persistent stats from a DEDICATED FILE
 void ConsistencyTrainer::LoadPersistentStats() {
-    CVarWrapper cvar = cvarManager->getCvar("ct_persistent_data");
-    if (!cvar) return;
 
-    std::string storage_str = cvar.getStringValue();
+    // Read from the persistent data file using the stored absolute path
+    std::ifstream file(dataFilePath_);
+    std::string storage_str;
+
+    if (file.is_open()) {
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        storage_str = buffer.str();
+        file.close();
+        cvarManager->log("Persistence file successfully opened and read.");
+    }
+    else {
+        global_pack_stats_.clear();
+        cvarManager->log("Persistence file does not exist or could not be opened. Starting fresh.");
+        return;
+    }
+
     if (storage_str.empty()) {
         global_pack_stats_.clear();
-        cvarManager->log("Persistence CVar is empty.");
+        cvarManager->log("Persistence file was empty.");
         return;
     }
 
     try {
         global_pack_stats_ = DeserializeStats(storage_str);
-        cvarManager->log("Loaded persistent stats for " + std::to_string(global_pack_stats_.size()) + " packs.");
+        cvarManager->log("Loaded persistent stats for " + std::to_string(global_pack_stats_.size()) + " packs from file.");
     }
     catch (const std::exception& e) {
-        cvarManager->log("Error deserializing persistent data. Resetting stats. Error: " + std::string(e.what()));
+        cvarManager->log("Error deserializing persistent data from file. Resetting stats. Error: " + std::string(e.what()));
         global_pack_stats_.clear();
     }
 }
 
-// *** FIX: Logic to save persistent stats to CVar ***
+// ?? CRITICAL FIX: Logic to save persistent stats to a DEDICATED FILE
 void ConsistencyTrainer::SavePersistentStats() {
     // Only save if there is data to serialize
-    if (global_pack_stats_.empty()) return;
+    if (global_pack_stats_.empty()) {
+        // We do not delete the file here; we simply skip writing if the map is empty.
+        cvarManager->log("No data to save. Skipping file write.");
+        return;
+    }
 
     try {
         std::string serialized_data = SerializeStats(global_pack_stats_);
-        cvarManager->getCvar("ct_persistent_data").setValue(serialized_data);
-        cvarManager->log("Saved persistent stats.");
+
+        // Write the data directly to the persistent file using the stored absolute path
+        std::ofstream file(dataFilePath_, std::ios::trunc); // Overwrite file
+        if (file.is_open()) {
+            file << serialized_data;
+            file.close();
+            cvarManager->log("Saved persistent stats to dedicated file.");
+        }
+        else {
+            cvarManager->log("Error: Could not open persistence file for writing.");
+        }
     }
     catch (const std::exception& e) {
-        cvarManager->log("Error saving persistent data. Error: " + std::string(e.what()));
+        cvarManager->log("Error saving persistent data to file. Error: " + std::string(e.what()));
     }
 }
 
-// Safely initializes the session map ONLY when training starts 
+// Safely initializes the session map ONLY when training starts
 void ConsistencyTrainer::InitializeSessionStats()
 {
     // FIX: Save existing pack stats before initializing the new pack
+    // This ensures data from the last pack played is safely copied to the global persistence map *before* the session is cleared.
     if (!training_session_stats_.empty() && !current_pack_id_.empty()) {
         global_pack_stats_[current_pack_id_] = training_session_stats_;
     }
+    // The SavePersistentStats() call that was previously here has been REMOVED.
 
     training_session_stats_.clear();
     current_shot_index_ = 0;
@@ -295,25 +314,28 @@ void ConsistencyTrainer::InitializeSessionStats()
         // Ensure all rounds exist and initialize any missing or session-specific parts
         int total_shots = training_editor.GetTotalRounds();
         for (int i = 0; i < total_shots; ++i) {
+
+            // If shot is new, create the entry with defaults. This ensures training_session_stats_[i] is valid.
             if (training_session_stats_.find(i) == training_session_stats_.end()) {
-                // If a shot is new or missing, create a fresh entry
                 training_session_stats_[i] = ShotStats();
                 // Initialize min boost to max possible float value
                 training_session_stats_[i].min_successful_boost_used = std::numeric_limits<float>::max();
                 training_session_stats_[i].lifetime_min_boost = std::numeric_limits<float>::max();
             }
-            else {
-                // For existing shots, reset session-specific stats
-                ShotStats& stats = training_session_stats_[i];
-                stats.attempts = 0;
-                stats.successes = 0;
-                stats.total_boost_used = 0.0f;
-                stats.total_successful_boost_used = 0.0f;
-                stats.min_successful_boost_used = std::numeric_limits<float>::max();
-                // FIX: Re-initialize the lifetime-dependent variable if missing
-                if (stats.lifetime_min_boost == 0.0f) {
-                    stats.lifetime_min_boost = std::numeric_limits<float>::max();
-                }
+
+            // CRITICAL FIX: Define the reference here to avoid scope error (E0020/C2065)
+            ShotStats& stats = training_session_stats_[i];
+
+            // For existing (and newly created) shots, reset session-specific stats
+            stats.attempts = 0;
+            stats.successes = 0;
+            stats.total_boost_used = 0.0f;
+            stats.total_successful_boost_used = 0.0f;
+            stats.min_successful_boost_used = std::numeric_limits<float>::max();
+
+            // FIX: Re-initialize the lifetime-dependent variable if missing (e.g., loaded legacy data)
+            if (stats.lifetime_min_boost == 0.0f) {
+                stats.lifetime_min_boost = std::numeric_limits<float>::max();
             }
         }
         current_shot_index_ = training_editor.GetRoundNum();
@@ -324,7 +346,7 @@ void ConsistencyTrainer::InitializeSessionStats()
 // FIX: Iterate and zero out values instead of clearing the map
 void ConsistencyTrainer::ResetSessionStats()
 {
-    // Iterate over the existing map and zero out the current session counts. 
+    // Iterate over the existing map and zero out the current session counts.
     for (auto& pair : training_session_stats_) {
         // Only reset session-specific values, preserve lifetime data
         pair.second.attempts = 0;
@@ -397,7 +419,7 @@ void ConsistencyTrainer::UpdateLifetimeBest(ShotStats& stats) {
         }
         else if (stats.successes == stats.lifetime_best_successes)
         {
-            // Tie-breaker: If success count is equal, we must ensure the run length is AT LEAST equal 
+            // Tie-breaker: If success count is equal, we must ensure the run length is AT LEAST equal
             // before using boost as a tie-breaker.
             if (stats.attempts >= stats.lifetime_attempts_at_best) {
 
@@ -423,8 +445,8 @@ bool ConsistencyTrainer::IsShotFrozen()
 {
     if (training_session_stats_.find(current_shot_index_) == training_session_stats_.end()) return true;
 
-    ShotStats& stats = training_session_stats_[current_shot_index_];
-    // This check is now only used internally by OnSetVehicleInput and OnShotAttempt to prevent counting/boosting 
+    ShotStats& stats = training_session_stats_.at(current_shot_index_);
+    // This check is now only used internally by OnSetVehicleInput and OnShotAttempt to prevent counting/boosting
     // after the finalization logic in HandleAttempt has run.
     return stats.attempts >= max_attempts_per_shot_;
 }
@@ -484,9 +506,9 @@ void ConsistencyTrainer::OnShotAttempt(void* params)
         cvarManager->log("Shot attempt " + std::to_string(stats.attempts) + " started (Immediate Increment). Boost counter reset to 0.0.");
     }
     else if (stats.attempts >= max_attempts_per_shot_) {
-        // If we are here, it means the outcome for the final attempt (N) was processed in HandleAttempt, 
-        // which called ResetCurrentShotSessionStats (setting attempts to 0), but the current event 
-        // fired before the 0 was registered, or the counter was stuck. 
+        // If we are here, it means the outcome for the final attempt (N) was processed in HandleAttempt,
+        // which called ResetCurrentShotSessionStats (setting attempts to 0), but the current event
+        // fired before the 0 was registered, or the counter was stuck.
         // We force the reset state to 1 to cleanly start the next run.
         ResetCurrentShotSessionStats(stats); // Sets attempts to 0
         stats.attempts = 1; // Starts new run at 1
@@ -563,8 +585,13 @@ void ConsistencyTrainer::OnPlaylistIndexChanged(ActorWrapper caller, void* param
     if (current_shot_index_ != new_index && !training_session_stats_.empty()) {
         // FIX: Update lifetime best *ratio* and min boost when leaving a shot
         UpdateLifetimeBest(training_session_stats_[current_shot_index_]);
-        // Also save the current session data immediately when the player moves to a different shot
-        SavePersistentStats();
+
+        // CRITICAL: Transfer current session stats to global map.
+        if (!current_pack_id_.empty()) {
+            global_pack_stats_[current_pack_id_] = training_session_stats_;
+        }
+
+        // SAVE REMOVED
     }
 
     if (current_shot_index_ != new_index) {
@@ -584,7 +611,7 @@ void ConsistencyTrainer::HandleAttempt(bool isSuccess)
 {
     // Ensure we have stats for the current shot
     if (training_session_stats_.find(current_shot_index_) == training_session_stats_.end()) {
-        // If HandleAttempt is called but no stats exist, it likely means no attempt event fired yet.
+        // If HandleAttempt is called but no attempt event fired yet, skip.
         return;
     }
 
@@ -618,9 +645,16 @@ void ConsistencyTrainer::HandleAttempt(bool isSuccess)
     // Reset boost tracker (OnShotAttempt will also do this, but this is safer)
     current_attempt_boost_used_ = 0.0f;
 
-    // *** CRITICAL: Update lifetime best and save after EVERY attempt ***
+    // *** CRITICAL: Update lifetime best after EVERY attempt ***
     UpdateLifetimeBest(stats);
-    SavePersistentStats();
+
+    // ?? CRITICAL FIX: Transfer current session stats to global map.
+    // This ensures global_pack_stats_ is NOT empty and contains the latest data for serialization.
+    if (!current_pack_id_.empty()) {
+        global_pack_stats_[current_pack_id_] = training_session_stats_;
+    }
+
+    // SAVE REMOVED
 
     // 2. CHECK ATTEMPT COUNT AND DECIDE NEXT ACTION
     if (!is_final_attempt) {
@@ -712,7 +746,6 @@ void ConsistencyTrainer::RenderSettings()
             float avg_boost = (pair.second.attempts > 0) ? (pair.second.total_boost_used / pair.second.attempts) : 0.0f;
             float avg_success_boost = (pair.second.successes > 0) ? (pair.second.total_successful_boost_used / pair.second.successes) : 0.0f;
             float avg_success_boost_best_consist = (pair.second.lifetime_attempts_at_best > 0 && pair.second.lifetime_best_successes > 0) ? (pair.second.lifetime_total_successful_boost_at_best / best_successes_f) : 0.0f;
-
             float min_success_boost_curr = (pair.second.min_successful_boost_used != std::numeric_limits<float>::max()) ? pair.second.min_successful_boost_used : 0.0f;
             float min_success_boost_life = (pair.second.lifetime_min_boost != std::numeric_limits<float>::max()) ? pair.second.lifetime_min_boost : 0.0f;
 

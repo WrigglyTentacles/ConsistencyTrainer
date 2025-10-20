@@ -101,6 +101,9 @@ private:
     PersistentData global_pack_stats_;
     std::string current_pack_id_ = "";
 
+    // ?? CRITICAL ADDITION: Absolute file path for persistence
+    std::string dataFilePath_;
+
     // GUI Window state
     bool is_window_open_ = false;
     int text_pos_x_ = 100;
