@@ -591,7 +591,8 @@ void ConsistencyTrainer::OnPlaylistIndexChanged(ActorWrapper caller, void* param
             global_pack_stats_[current_pack_id_] = training_session_stats_;
         }
 
-        // SAVE REMOVED
+        // ?? RE-ADDED SAVE: Save persistence when changing shots.
+        SavePersistentStats();
     }
 
     if (current_shot_index_ != new_index) {
@@ -654,7 +655,8 @@ void ConsistencyTrainer::HandleAttempt(bool isSuccess)
         global_pack_stats_[current_pack_id_] = training_session_stats_;
     }
 
-    // SAVE REMOVED
+    // ?? RE-ADDED SAVE: Save persistence after a shot outcome is processed.
+    SavePersistentStats();
 
     // 2. CHECK ATTEMPT COUNT AND DECIDE NEXT ACTION
     if (!is_final_attempt) {
