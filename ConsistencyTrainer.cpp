@@ -800,12 +800,12 @@ void ConsistencyTrainer::RenderSettings()
             ImGui::Text("%.1f", avg_boost); ImGui::NextColumn();
             ImGui::Text("%.1f/%.1f", avg_success_boost, avg_success_boost_best_consist); ImGui::NextColumn();
 
-            // ?? DISPLAY FIX: Use a ternary operator to show "N/A" if the sentinel value is present.
+            // ?? DISPLAY FIX: Use "0.0" instead of "—" for compatibility if sentinel value is present.
             if (is_life_min_boost_set) {
                 ImGui::Text("%.1f/%.1f", min_success_boost_curr, min_success_boost_life); ImGui::NextColumn();
             }
             else {
-                ImGui::Text("%.1f/—", min_success_boost_curr); ImGui::NextColumn();
+                ImGui::Text("%.1f/0.0", min_success_boost_curr); ImGui::NextColumn();
             }
         }
         ImGui::Columns(1);
@@ -910,12 +910,12 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
         current_y += line_height;
 
         // Line 8: Min Success (Current vs. Lifetime Best)
-        // ?? DISPLAY FIX in Canvas: Use '—' for Best if the sentinel value is present
+        // ?? DISPLAY FIX in Canvas: Use "0.0" for Best if the sentinel value is present
         if (is_life_min_boost_set) {
             snprintf(buffer, sizeof(buffer), "Min (S): %.1f / Best: %.1f", min_success_boost_curr, min_success_boost_life);
         }
         else {
-            snprintf(buffer, sizeof(buffer), "Min (S): %.1f / Best: —", min_success_boost_curr);
+            snprintf(buffer, sizeof(buffer), "Min (S): %.1f / Best: 0.0", min_success_boost_curr);
         }
 
         canvas.SetPosition(Vector2{ text_pos_x_, current_y });
