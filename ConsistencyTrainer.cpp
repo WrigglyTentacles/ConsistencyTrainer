@@ -351,8 +351,8 @@ void ConsistencyTrainer::ResetCurrentShotSessionStats(ShotStats& stats)
 
 /**
  * @brief Updates the lifetime best stats based on the current session's performance.
- * * New Logic: Updates best consistency ONLY if the current run used MORE OR EQUAL attempts
- * than the existing lifetime best AND the ratio is maintained or improved.
+ * * This function is ONLY responsible for updating Success count and Boost metrics,
+ * * as lifetime_attempts_at_best is set in OnShotAttempt.
  */
 void ConsistencyTrainer::UpdateLifetimeBest(ShotStats& stats) {
 
@@ -366,40 +366,50 @@ void ConsistencyTrainer::UpdateLifetimeBest(ShotStats& stats) {
 
     // 2. Update Consistency & Associated Boost Metrics
     if (stats.attempts > 0) {
-        float current_ratio = (float)stats.successes / stats.attempts;
 
-        // Calculate lifetime best ratio (handle division by zero if lifetime attempts is 0)
-        float lifetime_ratio = (stats.lifetime_attempts_at_best > 0)
-            ? (float)stats.lifetime_best_successes / stats.lifetime_attempts_at_best
-            : -1.0f; // Use -1.0f to ensure any real ratio is initially better
+        // CRITICAL CHECK: We only update consistency if the current run matches the recorded best length.
+        bool attempts_matched_best_length = (stats.attempts == stats.lifetime_attempts_at_best);
 
-        // Condition 1: Must maintain or beat the ratio (using a small epsilon for float comparison)
-        bool meets_ratio_threshold = current_ratio > lifetime_ratio || (std::abs(current_ratio - lifetime_ratio) < 0.0001f);
-
-        // Condition 2: Must be a run that is LONGER OR EQUAL in length (User's new mandate: >=)
-        bool meets_attempt_threshold = stats.attempts >= stats.lifetime_attempts_at_best;
-
-        bool should_update = false;
-
-        // Case A: No previous data (always update)
-        if (stats.lifetime_attempts_at_best == 0) {
-            should_update = true;
-        }
-        // Case B: New record must be LONGER OR EQUAL AND maintain/improve ratio
-        else if (meets_attempt_threshold && meets_ratio_threshold) {
-            should_update = true;
+        // If the current attempt count is NOT the longest recorded run, we cannot update the best success score yet.
+        if (!attempts_matched_best_length) {
+            return;
         }
 
-        if (should_update) {
-            // Update lifetime best metrics using current session's run data
+        // --- Consistency and Tie-breakers (Only when attempts MATCH best length) ---
+
+        bool should_update_consistency = false;
+        bool should_update_boost_only = false;
+
+        // Rule 2A: Update if strictly better success count.
+        if (stats.successes > stats.lifetime_best_successes) {
+            should_update_consistency = true;
+        }
+        // Rule 2B: Update if performance is matched (Success count is tied).
+        else if (stats.successes == stats.lifetime_best_successes)
+        {
+            // Tie-breaker: Check if current total boost used (for all attempts in the run) is lower than the recorded best.
+            float current_total_boost = stats.total_boost_used;
+            float best_total_boost = stats.lifetime_total_boost_at_best;
+
+            if (current_total_boost < best_total_boost) {
+                // If we found a run with the same length/success count but less total boost, update the boost metrics.
+                should_update_boost_only = true;
+            }
+        }
+
+        // --- APPLY CONSISTENCY UPDATES ---
+        if (should_update_consistency) {
+            // Update Success and associated Boost metrics
             stats.lifetime_best_successes = stats.successes;
-            stats.lifetime_attempts_at_best = stats.attempts;
-
-            // Recalculate and update associated boost metrics based on current run
             stats.lifetime_total_boost_at_best = stats.total_boost_used;
             stats.lifetime_total_successful_boost_at_best = stats.total_successful_boost_used;
-
-            cvarManager->log("New Lifetime Best Consistency (Sustained Run) for Shot " + std::to_string(current_shot_index_ + 1) + ": " + std::to_string(stats.successes) + "/" + std::to_string(stats.attempts));
+            cvarManager->log("New Lifetime Best Success for Shot " + std::to_string(current_shot_index_ + 1) + ": " + std::to_string(stats.successes) + "/" + std::to_string(stats.attempts));
+        }
+        else if (should_update_boost_only) {
+            // Update ONLY boost metrics (Tie-breaker for matching consistency)
+            stats.lifetime_total_boost_at_best = stats.total_boost_used;
+            stats.lifetime_total_successful_boost_at_best = stats.total_successful_boost_used;
+            cvarManager->log("Boost Tie-breaker Update for Shot " + std::to_string(current_shot_index_ + 1) + ". Same success count, but less total boost used.");
         }
     }
 }
@@ -455,6 +465,17 @@ void ConsistencyTrainer::OnShotAttempt(void* params)
 
     // CRITICAL FIX: Robust counter logic
     if (stats.attempts < max_attempts_per_shot_) {
+
+        // *** FIX 1: Update Best Attempts (Longest Run) on attempt start ***
+        // Rule: I want the best attempts to update any time the current attempts goes above the best attempts.
+        if (stats.attempts + 1 > stats.lifetime_attempts_at_best) {
+            stats.lifetime_attempts_at_best = stats.attempts + 1;
+
+            // NOTE: We don't touch lifetime_best_successes here; it will be updated in HandleAttempt 
+            // once a scoring outcome is available for this new, longer run length.
+            cvarManager->log("New Lifetime Best Run Length (Attempts) set to: " + std::to_string(stats.lifetime_attempts_at_best) + " upon shot start.");
+        }
+
         // Normal increment for attempts 1 through N
         stats.attempts++;
         cvarManager->log("Shot attempt " + std::to_string(stats.attempts) + " started (Immediate Increment). Boost counter reset to 0.0.");
@@ -668,12 +689,15 @@ void ConsistencyTrainer::RenderSettings()
         ImGui::Text("Success/Best"); ImGui::NextColumn();
         ImGui::Text("Attempts/Best"); ImGui::NextColumn(); // MODIFIED HEADER
         ImGui::Text("Consistency"); ImGui::NextColumn();
+        float lifetime_ratio = 0.0f;
+
         ImGui::Text("Avg Boost (All)"); ImGui::NextColumn();
         ImGui::Text("Avg Boost (Success/Best)"); ImGui::NextColumn(); // Combined display
         ImGui::Text("Min Boost (Curr/Best)"); ImGui::NextColumn(); // NEW COLUMN
         ImGui::Separator();
         for (const auto& pair : training_session_stats_)
         {
+            // FIX: Corrected calculation for current session consistency
             float consistency = (pair.second.attempts > 0) ? (static_cast<float>(pair.second.successes) / pair.second.attempts * 100.0f) : 0.0f;
             float best_consistency = (pair.second.lifetime_attempts_at_best > 0) ? (static_cast<float>(pair.second.lifetime_best_successes) / pair.second.lifetime_attempts_at_best * 100.0f) : 0.0f;
 
@@ -706,7 +730,8 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
 {
     if (!is_plugin_enabled_ || !is_window_open_ || !IsInValidTraining()) { return; }
 
-    if (training_session_stats_.empty() || training_session_stats_.find(current_shot_index_) == training_session_stats_.end())
+    // *** FIX 2: Relaxed check to allow drawing if the current shot index has a map entry ***
+    if (training_session_stats_.find(current_shot_index_) == training_session_stats_.end())
     {
         canvas.SetColor(255, 255, 255, 255);
         canvas.SetPosition(Vector2{ text_pos_x_, text_pos_y_ });
@@ -717,12 +742,18 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
     ShotStats& current_stats = training_session_stats_.at(current_shot_index_);
 
     // Calculate values
-    float consistency = (current_stats.attempts > 0) ? (static_cast<float>(current_stats.successes) / current_stats.attempts * 100.0f) : 0.0f;
-    float best_consistency = (current_stats.lifetime_attempts_at_best > 0) ? (static_cast<float>(current_stats.lifetime_best_successes) / current_stats.lifetime_attempts_at_best * 100.0f) : 0.0f;
+    // FIX 3: Ensure explicit casting for floating point division for consistency.
+    float current_successes_f = static_cast<float>(current_stats.successes);
+    float current_attempts_f = static_cast<float>(current_stats.attempts);
+    float best_successes_f = static_cast<float>(current_stats.lifetime_best_successes);
+    float best_attempts_f = static_cast<float>(current_stats.lifetime_attempts_at_best);
+
+    float consistency = (current_stats.attempts > 0) ? (current_successes_f / current_attempts_f * 100.0f) : 0.0f;
+    float best_consistency = (current_stats.lifetime_attempts_at_best > 0) ? (best_successes_f / best_attempts_f * 100.0f) : 0.0f;
 
     float avg_boost = (current_stats.attempts > 0) ? (current_stats.total_boost_used / current_stats.attempts) : 0.0f;
     float avg_success_boost = (current_stats.successes > 0) ? (current_stats.total_successful_boost_used / current_stats.successes) : 0.0f;
-    float avg_success_boost_best_consist = (current_stats.lifetime_attempts_at_best > 0 && current_stats.lifetime_best_successes > 0) ? (current_stats.lifetime_total_successful_boost_at_best / current_stats.lifetime_best_successes) : 0.0f;
+    float avg_success_boost_best_consist = (current_stats.lifetime_attempts_at_best > 0 && current_stats.lifetime_best_successes > 0) ? (current_stats.lifetime_total_successful_boost_at_best / best_successes_f) : 0.0f;
     float min_success_boost_curr = (current_stats.min_successful_boost_used != std::numeric_limits<float>::max()) ? current_stats.min_successful_boost_used : 0.0f;
     float min_success_boost_life = (current_stats.lifetime_min_boost != std::numeric_limits<float>::max()) ? current_stats.lifetime_min_boost : 0.0f;
 

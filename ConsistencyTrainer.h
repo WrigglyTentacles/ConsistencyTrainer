@@ -27,7 +27,7 @@ struct ShotStats
 
     // Persistent Lifetime Bests (Metrics tracked from the best consistency run)
     int lifetime_best_successes = 0;
-    int lifetime_attempts_at_best = 0; // Will be equal to max_attempts_per_shot_
+    int lifetime_attempts_at_best = 0;
     float lifetime_total_boost_at_best = 0.0f;
     float lifetime_total_successful_boost_at_best = 0.0f;
     float lifetime_min_boost = std::numeric_limits<float>::max(); // Absolute lowest boost used on any successful shot
@@ -60,7 +60,7 @@ private:
     void SavePersistentStats();
     void UpdateLifetimeBest(ShotStats& current_stats);
     std::string GetCurrentPackID();
-    // *** NEW: Helper to get the total number of shots for index correction ***
+    // NEW: Helper to get the total number of shots for index correction
     int GetTotalRounds();
 
     // Game event hooks
@@ -82,7 +82,6 @@ private:
     // NEW: Helper to reset session stats for the current shot
     void ResetCurrentShotSessionStats(ShotStats& stats);
     bool IsInValidTraining();
-    // AdvanceToNextShot() removed.
     void RepeatCurrentShot();
 
     // Plugin state
