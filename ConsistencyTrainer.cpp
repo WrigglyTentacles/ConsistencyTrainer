@@ -6,15 +6,11 @@
 #include <algorithm>
 #include <iostream>
 #include <fstream>
-#include <map> // Include for std::map
+#include <map>
 
-// --- Assuming these types are defined in ConsistencyTrainer.h ---
-// If ShotStats is defined in .h, these should be too.
-// Adding them here temporarily to resolve the E0020 error, 
-// but they should ideally be in ConsistencyTrainer.h or another shared header.
+// Type definitions to resolve E0020
 using PackStats = std::map<int, ShotStats>;
 using PersistentData = std::map<std::string, PackStats>;
-// -----------------------------------------------------------------
 
 std::string SerializeStats(const PersistentData& data) {
     std::stringstream ss;
@@ -282,7 +278,6 @@ void ConsistencyTrainer::InitializeSessionStats()
     }
 
     // CRITICAL FIX: Clear the session map before attempting to populate it.
-    // This ensures no previous, larger pack's shot indices remain in the session view.
     training_session_stats_.clear();
 
     current_shot_index_ = 0;
@@ -298,7 +293,6 @@ void ConsistencyTrainer::InitializeSessionStats()
         if (training_editor.IsNull()) return;
 
         // Load persistent data for the new pack if it exists
-        // Use a temporary map 'pack_lifetime_stats' to hold the global data for the current pack ID.
         PackStats pack_lifetime_stats;
         if (global_pack_stats_.count(current_pack_id_)) {
             pack_lifetime_stats = global_pack_stats_.at(current_pack_id_);
@@ -656,12 +650,15 @@ void ConsistencyTrainer::RenderSettings()
             double avg_boost = (pair.second.attempts > 0) ? (pair.second.total_boost_used / current_attempts_d) : 0.0;
             double avg_success_boost = (pair.second.successes > 0) ? (pair.second.total_successful_boost_used / current_successes_d) : 0.0;
             double avg_success_boost_best_consist = (pair.second.lifetime_attempts_at_best > 0 && pair.second.lifetime_best_successes > 0) ? (pair.second.lifetime_total_successful_boost_at_best / best_successes_d) : 0.0;
-            double min_success_boost_curr = (pair.second.min_successful_boost_used != std::numeric_limits<double>::max()) ? pair.second.min_successful_boost_used : 0.0;
 
             double sentinel = std::numeric_limits<double>::max();
-            bool is_life_min_boost_set = pair.second.lifetime_min_boost < sentinel;
+            double min_success_boost_curr = (pair.second.min_successful_boost_used != sentinel) ? pair.second.min_successful_boost_used : 0.0;
 
-            double min_success_boost_life = is_life_min_boost_set ? pair.second.lifetime_min_boost : 0.0;
+            // Re-implementing the display logic check for lifetime_min_boost
+            // The condition is: display the actual boost ONLY if it is NOT the sentinel value.
+            bool is_lifetime_boost_set = pair.second.lifetime_min_boost < 100000000.0; // Check if it's less than a huge number (safely avoiding sentinel corruption)
+
+            double display_life_min_boost = pair.second.lifetime_min_boost;
 
             ImGui::Text("%d", pair.first + 1); ImGui::NextColumn();
             ImGui::Text("%d/%d", pair.second.successes, pair.second.lifetime_best_successes); ImGui::NextColumn();
@@ -670,10 +667,13 @@ void ConsistencyTrainer::RenderSettings()
             ImGui::Text("%.1f", (float)avg_boost); ImGui::NextColumn();
             ImGui::Text("%.1f/%.1f", (float)avg_success_boost, (float)avg_success_boost_best_consist); ImGui::NextColumn();
 
-            if (is_life_min_boost_set) {
-                ImGui::Text("%.1f/%.1f", (float)min_success_boost_curr, (float)min_success_boost_life); ImGui::NextColumn();
+            // FIX: Use the robust threshold check for display.
+            if (is_lifetime_boost_set) {
+                // If it's a reasonable, non-sentinel value, display it.
+                ImGui::Text("%.1f/%.1f", (float)min_success_boost_curr, (float)display_life_min_boost); ImGui::NextColumn();
             }
             else {
+                // Sentinel value or corruption detected, force print 0.0 for the 'Best' part.
                 ImGui::Text("%.1f/0.0", (float)min_success_boost_curr); ImGui::NextColumn();
             }
         }
@@ -708,12 +708,14 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
     double avg_boost = (current_stats.attempts > 0) ? (current_stats.total_boost_used / current_attempts_d) : 0.0;
     double avg_success_boost = (current_stats.successes > 0) ? (current_stats.total_successful_boost_used / current_successes_d) : 0.0;
     double avg_success_boost_best_consist = (current_stats.lifetime_attempts_at_best > 0 && current_stats.lifetime_best_successes > 0) ? (current_stats.lifetime_total_successful_boost_at_best / best_successes_d) : 0.0;
-    double min_success_boost_curr = (current_stats.min_successful_boost_used != std::numeric_limits<double>::max()) ? current_stats.min_successful_boost_used : 0.0;
 
     double sentinel = std::numeric_limits<double>::max();
-    bool is_life_min_boost_set = current_stats.lifetime_min_boost < sentinel;
+    double min_success_boost_curr = (current_stats.min_successful_boost_used != sentinel) ? current_stats.min_successful_boost_used : 0.0;
 
-    double min_success_boost_life = is_life_min_boost_set ? current_stats.lifetime_min_boost : 0.0;
+    // Re-implementing the display logic check for lifetime_min_boost
+    bool is_lifetime_boost_set = current_stats.lifetime_min_boost < 100000000.0; // Check if it's less than a huge number
+
+    double display_life_min_boost = current_stats.lifetime_min_boost;
 
     float line_height = 20.0f * text_scale_;
     int current_y = text_pos_y_;
@@ -762,10 +764,12 @@ void ConsistencyTrainer::RenderWindow(CanvasWrapper canvas)
         canvas.DrawString(buffer, text_scale_, text_scale_);
         current_y += line_height;
 
-        if (is_life_min_boost_set) {
-            snprintf(buffer, sizeof(buffer), "Min (S): %.1f / Best: %.1f", (float)min_success_boost_curr, (float)min_success_boost_life);
+        // FIX: Use the robust threshold check for display.
+        if (is_lifetime_boost_set) {
+            snprintf(buffer, sizeof(buffer), "Min (S): %.1f / Best: %.1f", (float)min_success_boost_curr, (float)display_life_min_boost);
         }
         else {
+            // Sentinel value or corruption detected, force print 0.0 for the 'Best' part.
             snprintf(buffer, sizeof(buffer), "Min (S): %.1f / Best: 0.0", (float)min_success_boost_curr);
         }
 
